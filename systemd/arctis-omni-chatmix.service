@@ -1,0 +1,12 @@
+[Unit]
+Description=Arctis Nova Pro Omni ChatMix dial -> PipeWire Game/Chat sinks
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service
+
+[Service]
+ExecStart=%h/.local/bin/arctis-omni chatmix-daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
