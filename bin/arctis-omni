@@ -152,7 +152,9 @@ def cmd_sidetone(hub, args):
 
 
 def set_volume(sink, percent):
-    subprocess.run(["pactl", "set-sink-volume", sink, f"{percent}%"], check=False)
+    result = subprocess.run(["pactl", "set-sink-volume", sink, f"{percent}%"],
+                            check=False, capture_output=True)
+    return result.returncode == 0
 
 
 def cmd_chatmix_daemon(_hub, _args):
@@ -176,14 +178,18 @@ def cmd_chatmix_daemon(_hub, _args):
             hub = Hub()
             hub.send(CMD_SOFTWARE_CHATMIX, 1)
             a = hub.audio_settings()
-            set_volume(GAME_SINK, a["chatmix_game"])
-            set_volume(CHAT_SINK, a["chatmix_chat"])
-            print(f"chatmix active on {path}: game {a['chatmix_game']}% chat {a['chatmix_chat']}%", flush=True)
+            mix = (a["chatmix_game"], a["chatmix_chat"])
+            print(f"chatmix active on {path}: game {mix[0]}% chat {mix[1]}%", flush=True)
+            # Applied flag stays False until both sinks accept the volume, so a mix that
+            # failed (sinks not up yet, PipeWire restarting) is retried every second.
+            applied = False
             while not stop:
+                if not applied:
+                    applied = set_volume(GAME_SINK, mix[0]) & set_volume(CHAT_SINK, mix[1])
                 d = hub.read(1.0)
                 if d and d[0] == EVENT and d[1] == EV_CHATMIX:
-                    set_volume(GAME_SINK, d[2])
-                    set_volume(CHAT_SINK, d[3])
+                    mix = (d[2], d[3])
+                    applied = False
         except OSError as e:
             print(f"hub lost ({e}), waiting for it to come back", flush=True)
             time.sleep(3)

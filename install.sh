@@ -12,12 +12,13 @@ PIPEWIRE_DIR="$HOME/.config/pipewire/pipewire.conf.d"
 PLASMOID_DIR="$HOME/.local/share/plasma/plasmoids/local.arctis-omni-battery"
 UDEV_RULE=/etc/udev/rules.d/70-arctis-nova-pro-omni.rules
 
-# install_if_changed SRC DEST MODE: copies only when content differs; returns 0 if it copied.
+# install_if_changed SRC DEST MODE: copies only when content differs; returns 0 if it copied,
+# 1 if unchanged. A failed copy exits here, since callers' `&&` chains suspend set -e.
 install_if_changed() {
     if cmp -s "$1" "$2"; then
         return 1
     fi
-    install -Dm"$3" "$1" "$2"
+    install -Dm"$3" "$1" "$2" || { echo "error: could not install $2" >&2; exit 1; }
 }
 
 if ! cmp -s udev/70-arctis-nova-pro-omni.rules "$UDEV_RULE"; then
