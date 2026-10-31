@@ -1,5 +1,5 @@
 [Unit]
-Description=Arctis Nova Pro Omni ChatMix dial -> PipeWire Game/Chat sinks
+Description=Arctis ChatMix dial -> PipeWire Game/Chat sinks
 After=pipewire.service pipewire-pulse.service wireplumber.service
 Wants=pipewire-pulse.service
 # PipeWire recreates the Game/Chat sinks at 100% on restart; restarting with it re-applies the dial.
