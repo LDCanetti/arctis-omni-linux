@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Control the SteelSeries Arctis Nova Pro Omni GameHub (1038:2290) over hidraw.
+
+Protocol derived from SteelSeries GG's device definitions, for interoperability:
+commands are 64-byte output reports with report ID 0x01 on the usage-page 0xFFC0
+collection; the hub pushes events as report ID 0x07.
+"""
+import argparse
+import fcntl
+import glob
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+VID_PID = "00001038:00002290"
+REPORT = 0x01
+EVENT = 0x07
+
+CMD_STATUS = 0xB0
+CMD_AUDIO_SETTINGS = 0x20
+CMD_SIDETONE = 0x38
+CMD_ANC_LEVEL = 0xB8
+CMD_TRANSPARENT_LEVEL = 0xB9
+CMD_ANC_MODE = 0xBD
+CMD_SOFTWARE_CHATMIX = 0x49
+EV_CHATMIX = 0x45
+
+ANC_MODES = {"off": 0, "transparency": 1, "anc": 2}
+GAME_SINK = "arctis_omni_game"
+CHAT_SINK = "arctis_omni_chat"
+
+
+def find_hidraw():
+    # The hub exposes two hidraw nodes; the command channel's report descriptor
+    # starts with Usage Page 0xFFC0 (06 C0 FF).
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(f"{node}/device/uevent") as f:
+                if f"HID_ID=0003:{VID_PID}" not in f.read().upper():
+                    continue
+            with open(f"{node}/device/report_descriptor", "rb") as f:
+                if f.read(3) == b"\x06\xc0\xff":
+                    return "/dev/" + os.path.basename(node)
+        except OSError:
+            continue
+    return None
+
+
+class Hub:
+    def __init__(self):
+        path = find_hidraw()
+        if not path:
+            sys.exit("Arctis Nova Pro Omni GameHub not found")
+        self.fd = os.open(path, os.O_RDWR)
+
+    def send(self, *payload):
+        os.write(self.fd, bytes([REPORT, *payload]) + bytes(63 - len(payload)))
+
+    def read(self, timeout):
+        if not select.select([self.fd], [], [], timeout)[0]:
+            return None
+        return os.read(self.fd, 64)
+
+    def query(self, cmd, attempts=3):
+        # Event reports are interleaved on the same collection, so skip until our reply.
+        for _ in range(attempts):
+            self.send(cmd)
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                d = self.read(deadline - time.time())
+                if d and d[0] == REPORT and d[1] == cmd:
+                    return d
+        sys.exit(f"no reply to command {cmd:#04x}")
+
+    def audio_settings(self):
+        self.send(CMD_AUDIO_SETTINGS)
+        time.sleep(0.1)
+        size = 1037
+        buf = bytearray(size)
+        buf[0] = REPORT
+        fcntl.ioctl(self.fd, (3 << 30) | (size << 16) | (ord("H") << 8) | 0x07, buf)  # HIDIOCGFEATURE
+        # Layout: command, 2x10 EQ bands of 6 bytes, 10 BT + 10 mic gains, then settings.
+        b = 1 + 60 + 60 + 20
+        return {
+            "mic_volume": buf[b + 4],
+            "sidetone_level": buf[b + 5],
+            "chatmix_game": buf[b + 10],
+            "chatmix_chat": buf[b + 11],
+            "sidetone_on": buf[b + 28],
+        }
+
+
+def cmd_status(hub, args):
+    s = hub.query(CMD_STATUS)
+    a = hub.audio_settings()
+    mode = {v: k for k, v in ANC_MODES.items()}.get(s[10], s[10])
+    connected = s[14] == 0x08
+    if args.json:
+        print(json.dumps({
+            "connected": connected,
+            "battery": s[6],
+            "charger_battery": s[7],
+            "charging": s[15] == 0x02,
+            "noise_mode": mode,
+            "anc_level": s[16],
+            "transparency_level": s[8],
+            "sidetone_on": bool(a["sidetone_on"]),
+            "sidetone_level": a["sidetone_level"],
+            "mic_volume": a["mic_volume"],
+            "mic_muted": bool(s[9]),
+            "chatmix_game": a["chatmix_game"],
+            "chatmix_chat": a["chatmix_chat"],
+        }))
+        return
+    print(f"headset:      {'connected' if connected else 'not connected'}")
+    if connected:
+        print(f"battery:      {s[6]}%")
+    print(f"charger:      {s[7]}%")
+    print(f"noise mode:   {mode}  (ANC level {s[16]}/3, transparency level {s[8]}/10)")
+    print(f"sidetone:     {'on' if a['sidetone_on'] else 'off'}, level {a['sidetone_level']}/10")
+    print(f"mic:          volume {a['mic_volume']}/10, {'muted' if s[9] else 'unmuted'}")
+    print(f"chatmix dial: game {a['chatmix_game']}%, chat {a['chatmix_chat']}%")
+
+
+def cmd_anc(hub, args):
+    hub.send(CMD_ANC_MODE, ANC_MODES[args.mode])
+
+
+def cmd_anc_level(hub, args):
+    hub.send(CMD_ANC_LEVEL, args.level)
+
+
+def cmd_transparency_level(hub, args):
+    hub.send(CMD_TRANSPARENT_LEVEL, args.level)
+
+
+def cmd_sidetone(hub, args):
+    a = hub.audio_settings()
+    if args.value == "on":
+        hub.send(CMD_SIDETONE, 1, a["sidetone_level"])
+    elif args.value == "off":
+        hub.send(CMD_SIDETONE, 0, a["sidetone_level"])
+    else:
+        level = int(args.value) if args.value.isdigit() else 0
+        if not 1 <= level <= 10:
+            sys.exit("sidetone level must be 1-10, on or off")
+        hub.send(CMD_SIDETONE, 1, level)
+
+
+def set_volume(sink, percent):
+    subprocess.run(["pactl", "set-sink-volume", sink, f"{percent}%"], check=False)
+
+
+def cmd_chatmix_daemon(_hub, _args):
+    # Puts the hub in software-ChatMix mode (as GG/Sonar does) and mirrors the dial
+    # onto the Game/Chat loopback sinks. Reconnects if the hub goes away.
+    stop = False
+
+    def on_signal(*_):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    while not stop:
+        path = find_hidraw()
+        if not path:
+            time.sleep(3)
+            continue
+        hub = None
+        try:
+            hub = Hub()
+            hub.send(CMD_SOFTWARE_CHATMIX, 1)
+            a = hub.audio_settings()
+            set_volume(GAME_SINK, a["chatmix_game"])
+            set_volume(CHAT_SINK, a["chatmix_chat"])
+            print(f"chatmix active on {path}: game {a['chatmix_game']}% chat {a['chatmix_chat']}%", flush=True)
+            while not stop:
+                d = hub.read(1.0)
+                if d and d[0] == EVENT and d[1] == EV_CHATMIX:
+                    set_volume(GAME_SINK, d[2])
+                    set_volume(CHAT_SINK, d[3])
+        except OSError as e:
+            print(f"hub lost ({e}), waiting for it to come back", flush=True)
+            time.sleep(3)
+        finally:
+            if hub:
+                try:
+                    hub.send(CMD_SOFTWARE_CHATMIX, 0)
+                except OSError:
+                    pass
+                os.close(hub.fd)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="arctis-omni", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="command", required=True)
+    s = sub.add_parser("status", help="battery, ANC, sidetone and ChatMix state")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+    s = sub.add_parser("anc", help="noise mode")
+    s.add_argument("mode", choices=ANC_MODES)
+    s.set_defaults(func=cmd_anc)
+    s = sub.add_parser("anc-level", help="ANC strength 1-3")
+    s.add_argument("level", type=int, choices=range(1, 4))
+    s.set_defaults(func=cmd_anc_level)
+    s = sub.add_parser("transparency-level", help="transparency strength 1-10")
+    s.add_argument("level", type=int, choices=range(1, 11))
+    s.set_defaults(func=cmd_transparency_level)
+    s = sub.add_parser("sidetone", help="on, off, or level 1-10")
+    s.add_argument("value")
+    s.set_defaults(func=cmd_sidetone)
+    sub.add_parser("chatmix-daemon", help="run the ChatMix dial service").set_defaults(func=cmd_chatmix_daemon)
+    args = p.parse_args()
+    args.func(None if args.command == "chatmix-daemon" else Hub(), args)
+
+
+if __name__ == "__main__":
+    main()
