@@ -147,8 +147,19 @@ PlasmoidItem {
                     snapMode: PlasmaComponents.Slider.SnapAlways
                     enabled: root.connected
                     Layout.fillWidth: true
+                    function apply() { root.run("sidetone " + (value === 0 ? "off" : value)); }
                     onPressedChanged: {
-                        if (!pressed) root.run("sidetone " + (value === 0 ? "off" : value));
+                        if (!pressed) apply();
+                    }
+                    // The mouse wheel steps the value and emits moved() without a press, so
+                    // wait for the scrolling to settle and send once.
+                    onMoved: {
+                        if (!pressed) wheelSettle.restart();
+                    }
+                    Timer {
+                        id: wheelSettle
+                        interval: 300
+                        onTriggered: sidetoneSlider.apply()
                     }
                     Connections {
                         target: root

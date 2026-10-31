@@ -2,8 +2,9 @@
 Description=Arctis ChatMix dial -> PipeWire Game/Chat sinks
 After=pipewire.service pipewire-pulse.service wireplumber.service
 Wants=pipewire-pulse.service
-# PipeWire recreates the Game/Chat sinks at 100% on restart; restarting with it re-applies the dial.
-PartOf=pipewire.service
+# PipeWire recreates the Game/Chat sinks at 100% on restart, and a WirePlumber restart drops the
+# routing metadata; restarting with either re-applies the dial and the routing.
+PartOf=pipewire.service wireplumber.service
 
 [Service]
 ExecStart=%h/.local/bin/arctis-omni chatmix-daemon
