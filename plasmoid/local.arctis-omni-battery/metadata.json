@@ -1,0 +1,13 @@
+{
+    "KPlugin": {
+        "Authors": [{ "Name": "LDCanetti" }],
+        "Category": "System Information",
+        "Description": "Battery and status of the Arctis Nova Pro Omni headset",
+        "Icon": "audio-headset",
+        "Id": "local.arctis-omni-battery",
+        "Name": "Arctis Omni Battery",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
