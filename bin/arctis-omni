@@ -33,6 +33,9 @@ ANC_MODES = {"off": 0, "transparency": 1, "anc": 2}
 GAME_SINK = "arctis_omni_game"
 CHAT_SINK = "arctis_omni_chat"
 LOOPBACK_OUTPUTS = ("arctis_omni_game_out", "arctis_omni_chat_out")
+# Where Game/Chat play when not on the headset: a sink name, set with `arctis-omni output`.
+OUTPUT_STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                            "arctis-omni", "output")
 
 
 class Omni:
@@ -280,20 +283,39 @@ def set_volume(sink, percent):
     return result.returncode == 0
 
 
+def list_sinks():
+    try:
+        out = subprocess.run(["pactl", "list", "short", "sinks"], check=True,
+                             capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [line.split("\t")[1] for line in out.splitlines() if len(line.split("\t")) > 1]
+
+
 def find_sink(product):
     # The connected headset's ALSA sink. Its name changes with the card profile (e.g.
     # analog-stereo vs. pro-output-0), so callers re-check it rather than caching it.
     if not product:
         return None
-    try:
-        sinks = subprocess.run(["pactl", "list", "short", "sinks"], check=True,
-                               capture_output=True, text=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return None
     # The trailing "-" keeps "Arctis Nova Pro" from matching "Arctis Nova Pro Wireless/Omni".
     prefix = "alsa_output.usb-SteelSeries_" + product.replace(" ", "_") + "-"
-    return next((line.split("\t")[1] for line in sinks.splitlines()
-                 if line.split("\t")[1:2] and line.split("\t")[1].startswith(prefix)), None)
+    return next((name for name in list_sinks() if name.startswith(prefix)), None)
+
+
+def output_override():
+    try:
+        with open(OUTPUT_STATE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def desired_target(product):
+    # The chosen output if it exists right now, otherwise the headset.
+    override = output_override()
+    if override and override in list_sinks():
+        return override
+    return find_sink(product)
 
 
 def route_outputs(target):
@@ -359,12 +381,12 @@ def cmd_chatmix_daemon(_hub, _args):
                         applied = False
                         print(f"dial at game {mix[0]}% chat {mix[1]}%", flush=True)
                 if time.monotonic() >= next_route_check:
-                    target = find_sink(hub.product)
+                    target = desired_target(hub.product)
                     if target and target != routed_to and route_outputs(target):
                         routed_to = target
                         print(f"game/chat outputs routed to {target}", flush=True)
                     # Retry every second until routed, then re-check every 10 s in case the
-                    # sink was renamed (card profile change).
+                    # sink was renamed (card profile change) or the output was switched.
                     settled = target is not None and target == routed_to
                     next_route_check = time.monotonic() + (10 if settled else 1)
                 if mix is not None and not applied:
@@ -386,6 +408,35 @@ def cmd_chatmix_daemon(_hub, _args):
                 os.close(hub.fd)
 
 
+def cmd_output(_hub, args):
+    # Choose where Arctis Game/Chat play: the headset, or another output such as speakers.
+    # The choice is saved so the ChatMix service keeps it across restarts.
+    if args.target is None:
+        print(output_override() or "headset")
+        return
+    if args.target == "headset":
+        try:
+            os.remove(OUTPUT_STATE)
+        except FileNotFoundError:
+            pass
+        found = find_hub()
+        target = find_sink(found[2]) if found else None
+        if not target:
+            print("Output set to the headset; it will be used once it's connected")
+            return
+    else:
+        target = args.target
+        if target.startswith("arctis_omni_"):
+            sys.exit("Game/Chat can't be routed into themselves; pick a real output")
+        if target not in list_sinks():
+            sys.exit(f"No output named {target!r}; see 'pactl list short sinks'")
+        os.makedirs(os.path.dirname(OUTPUT_STATE), exist_ok=True)
+        with open(OUTPUT_STATE, "w") as f:
+            f.write(target + "\n")
+    if not route_outputs(target):
+        sys.exit("Couldn't route Game/Chat (are the Arctis Game/Chat sinks loaded?)")
+
+
 def main():
     p = argparse.ArgumentParser(prog="arctis-omni", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -405,8 +456,12 @@ def main():
     s.add_argument("value")
     s.set_defaults(func=cmd_sidetone)
     sub.add_parser("chatmix-daemon", help="run the ChatMix dial service").set_defaults(func=cmd_chatmix_daemon)
+    s = sub.add_parser("output", help="where Game/Chat play: show, 'headset', or an output's sink name")
+    s.add_argument("target", nargs="?")
+    s.set_defaults(func=cmd_output)
     args = p.parse_args()
-    args.func(None if args.command == "chatmix-daemon" else Hub(), args)
+    needs_hub = args.command not in ("chatmix-daemon", "output")
+    args.func(Hub() if needs_hub else None, args)
 
 
 if __name__ == "__main__":
