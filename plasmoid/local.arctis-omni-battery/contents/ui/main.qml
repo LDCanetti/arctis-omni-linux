@@ -55,6 +55,49 @@ PlasmoidItem {
         }
     }
 
+    // A stepped slider that follows the status poll and emits commit(value) when a drag
+    // ends or mouse-wheel scrolling settles, so a change is one command.
+    component LevelSlider: RowLayout {
+        id: level
+        property var status: null
+        property alias from: slider.from
+        property alias to: slider.to
+        property var valueFrom: status => 0
+        property var label: value => String(value)
+        signal commit(int value)
+        Layout.fillWidth: true
+
+        onStatusChanged: {
+            // Don't overwrite a drag, or a scroll that hasn't been sent yet.
+            if (status && !slider.pressed && !settle.running)
+                slider.value = valueFrom(status);
+        }
+
+        PlasmaComponents.Slider {
+            id: slider
+            stepSize: 1
+            snapMode: PlasmaComponents.Slider.SnapAlways
+            enabled: level.enabled
+            Layout.fillWidth: true
+            onPressedChanged: {
+                if (!pressed) level.commit(value);
+            }
+            // The mouse wheel steps the value and emits moved() without a press.
+            onMoved: {
+                if (!pressed) settle.restart();
+            }
+            Timer {
+                id: settle
+                interval: 300
+                onTriggered: level.commit(slider.value)
+            }
+        }
+        PlasmaComponents.Label {
+            text: level.label(slider.value)
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 1.5
+        }
+    }
+
     function refresh() { runner.connectSource(tool + " status --json"); }
     function run(args) { runner.connectSource(tool + " " + args); }
 
@@ -142,46 +185,26 @@ PlasmoidItem {
                     : root.status.noise_mode === "transparency" ? "Transparency (level " + root.status.transparency_level + "/10)"
                     : "Off"
             }
-            RowLayout {
+            LevelSlider {
+                visible: root.status !== null && root.status.anc_level !== null
+                Kirigami.FormData.label: "ANC level:"
+                status: root.status
+                enabled: root.connected
+                from: 1
+                to: 3
+                valueFrom: status => status.anc_level
+                onCommit: value => root.run("anc-level " + value)
+            }
+            LevelSlider {
                 Kirigami.FormData.label: "Sidetone:"
-                Layout.fillWidth: true
-                // 0 = off, 1-max = on at that level (max is per model); sent on release so a
-                // drag is one command.
-                PlasmaComponents.Slider {
-                    id: sidetoneSlider
-                    from: 0
-                    to: root.status ? root.status.sidetone_max : 10
-                    stepSize: 1
-                    snapMode: PlasmaComponents.Slider.SnapAlways
-                    enabled: root.connected
-                    Layout.fillWidth: true
-                    function apply() { root.run("sidetone " + (value === 0 ? "off" : value)); }
-                    onPressedChanged: {
-                        if (!pressed) apply();
-                    }
-                    // The mouse wheel steps the value and emits moved() without a press, so
-                    // wait for the scrolling to settle and send once.
-                    onMoved: {
-                        if (!pressed) wheelSettle.restart();
-                    }
-                    Timer {
-                        id: wheelSettle
-                        interval: 300
-                        onTriggered: sidetoneSlider.apply()
-                    }
-                    Connections {
-                        target: root
-                        function onStatusChanged() {
-                            // Don't overwrite a drag, or a scroll that hasn't been sent yet.
-                            if (!sidetoneSlider.pressed && !wheelSettle.running && root.status)
-                                sidetoneSlider.value = root.status.sidetone_on ? root.status.sidetone_level : 0;
-                        }
-                    }
-                }
-                PlasmaComponents.Label {
-                    text: sidetoneSlider.value === 0 ? "Off" : sidetoneSlider.value
-                    Layout.minimumWidth: Kirigami.Units.gridUnit * 1.5
-                }
+                status: root.status
+                enabled: root.connected
+                // 0 = off, 1-max = on at that level (max is per model).
+                from: 0
+                to: root.status ? root.status.sidetone_max : 10
+                valueFrom: status => status.sidetone_on ? status.sidetone_level : 0
+                label: value => value === 0 ? "Off" : String(value)
+                onCommit: value => root.run("sidetone " + (value === 0 ? "off" : value))
             }
             PlasmaComponents.Label {
                 Kirigami.FormData.label: "Mic:"
