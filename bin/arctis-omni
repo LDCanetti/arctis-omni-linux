@@ -318,24 +318,57 @@ def desired_target(product):
     return find_sink(product)
 
 
-def route_outputs(target):
-    # Point the Game/Chat loopbacks at this sink via PipeWire's routing metadata, so the
-    # same sinks follow whichever headset is connected.
+def loopback_routing():
+    # {loopback output name: (node id, current target.object)} from PipeWire's "default"
+    # metadata, or None if the loopbacks aren't up.
     try:
         dump = json.loads(subprocess.run(["pw-dump"], check=True, capture_output=True,
                                          text=True).stdout)
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-        return False
+        return None
     ids = {o["info"]["props"].get("node.name"): o["id"] for o in dump
            if o.get("type") == "PipeWire:Interface:Node" and o.get("info")}
     if not all(name in ids for name in LOOPBACK_OUTPUTS):
+        return None
+    targets = {}
+    for o in dump:
+        if o.get("type") == "PipeWire:Interface:Metadata" and o.get("props", {}).get("metadata.name") == "default":
+            for entry in o.get("metadata") or []:
+                if entry.get("key") == "target.object":
+                    targets[entry.get("subject")] = entry.get("value")
+    return {name: (ids[name], targets.get(ids[name])) for name in LOOPBACK_OUTPUTS}
+
+
+def route_outputs(target):
+    # Point the Game/Chat loopbacks at this sink via PipeWire's routing metadata, so the
+    # same sinks follow whichever headset (or chosen output) is in use.
+    routing = loopback_routing()
+    if routing is None:
         return False
-    for name in LOOPBACK_OUTPUTS:
-        result = subprocess.run(["pw-metadata", "-n", "default", str(ids[name]), "target.object", target],
+    for node_id, _current in routing.values():
+        result = subprocess.run(["pw-metadata", "-n", "default", str(node_id), "target.object", target],
                                 check=False, capture_output=True)
         if result.returncode != 0:
             return False
     return True
+
+
+def reconcile_routing(product):
+    # Compare PipeWire's actual routing with the desired target and fix it if they differ.
+    # Reading the real state (rather than remembering what was last routed) also catches
+    # changes made by `arctis-omni output` or lost on a PipeWire restart. True when settled.
+    target = desired_target(product)
+    if not target:
+        return False
+    routing = loopback_routing()
+    if routing is None:
+        return False
+    if all(current == target for _node_id, current in routing.values()):
+        return True
+    if route_outputs(target):
+        print(f"game/chat outputs routed to {target}", flush=True)
+        return True
+    return False
 
 
 def valid_mix(game, chat):
@@ -358,6 +391,10 @@ def cmd_chatmix_daemon(_hub, _args):
     signal.signal(signal.SIGINT, on_signal)
     while not stop:
         if not find_hub():
+            # No headset to fall back to, but a saved output (e.g. speakers) still needs
+            # routing after PipeWire recreates the loopbacks.
+            if output_override():
+                reconcile_routing(None)
             time.sleep(3)
             continue
         hub = None
@@ -371,7 +408,6 @@ def cmd_chatmix_daemon(_hub, _args):
             # the dial position is known the volumes are left alone rather than zeroed.
             mix = None
             applied = False
-            routed_to = None
             next_route_check = 0.0
             while not stop:
                 if mix is None:
@@ -381,13 +417,9 @@ def cmd_chatmix_daemon(_hub, _args):
                         applied = False
                         print(f"dial at game {mix[0]}% chat {mix[1]}%", flush=True)
                 if time.monotonic() >= next_route_check:
-                    target = desired_target(hub.product)
-                    if target and target != routed_to and route_outputs(target):
-                        routed_to = target
-                        print(f"game/chat outputs routed to {target}", flush=True)
                     # Retry every second until routed, then re-check every 10 s in case the
                     # sink was renamed (card profile change) or the output was switched.
-                    settled = target is not None and target == routed_to
+                    settled = reconcile_routing(hub.product)
                     next_route_check = time.monotonic() + (10 if settled else 1)
                 if mix is not None and not applied:
                     applied = set_volume(GAME_SINK, mix[0]) & set_volume(CHAT_SINK, mix[1])
