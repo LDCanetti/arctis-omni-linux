@@ -22,6 +22,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import zlib
 
 VERSION = "0.3.0"
 VENDOR = 0x1038
@@ -145,9 +146,102 @@ class NovaProWireless:
     # (2.x). GG lists both targets for these base stations; the headset's MCU major
     # version tells which one is paired.
     fw_v2_headset = {0x12E0: 0x2240, 0x12E5: 0x2242}
-    flashable = ()
+    fw_flash_order = ("base DSP", "base MCU", "headset MCU", "headset Bluetooth")
+    # Flashing is verified on the Xbox base station with a v2 headset only.
+    flashable = (0x12E5,)
     update_hint = ("Update with SteelSeries GG on Windows, with the base station connected "
                    "to the PC by USB.")
+
+    @staticmethod
+    def part_name(pid):
+        return "base station" if pid in NPW_BASE_PIDS else "headset"
+
+    def recovery_version(self, cache, pid, chip):
+        chips = self.fw_flash_order[:2] if pid in NPW_BASE_PIDS else self.fw_flash_order[2:]
+        return folder_versions(bundle_folder(cache, pid), chips).get(chip)
+
+    @staticmethod
+    def flash_problem(jobs):
+        for pid in {job.pid for job in jobs}:
+            if pid in NPW_BASE_PIDS:
+                found = len(npw_base_nodes())
+                if found != 1:
+                    return f"Connect exactly one Arctis Nova Pro Wireless base station while updating (found {found})."
+            elif len(npw_headset_nodes(pid)) != 1:
+                return "Connect the headset (only one) to this PC with its USB cable."
+        return None
+
+    @staticmethod
+    def flash_ready(pid):
+        return vendor_nodes(pid, 0x06 if pid in NPW_BASE_PIDS else 0x07)
+
+    @staticmethod
+    def prepare_update(device, chips):
+        # The headset's own chips are updated over its USB cable.
+        headset = [c for c in chips if c.startswith("headset")]
+        if not headset:
+            return chips
+        pid = folder_pid(device.get("folders", {}).get(headset[0], "0"))
+        while not npw_headset_nodes(pid):
+            print("The headset is updated over its own USB cable: connect it to this PC with a USB")
+            print("cable and switch it on (keep the base station connected too).")
+            try:
+                answer = input("Press Enter when it's connected, or type 'skip' to update only the base station: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return []
+            if answer.strip() == "skip":
+                return [c for c in chips if c not in headset]
+        return chips
+
+    @staticmethod
+    def flash_notes(chips):
+        notes = ["Connect the base station to this PC directly with its USB cable (not through a USB hub)."]
+        if any(c.startswith("headset") for c in chips):
+            notes.append("Keep the headset switched on and connected by its USB cable.")
+        notes.append("Don't unplug anything until it says it's finished (a few minutes).")
+        if "base MCU" in chips or "headset MCU" in chips:
+            notes.append("The base station and headset restart during the update; sound stops for a moment.")
+        return notes
+
+    @staticmethod
+    def after_flash(jobs):
+        # A headset on a USB cable doesn't link to its base station.
+        if any(job.chip.startswith("headset") for job in jobs):
+            say("\nUnplug the headset's USB cable now: it reconnects to the base station only without it.")
+            pause("Press Enter when it's unplugged… ")
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if not find_hub():
+                    time.sleep(2)
+                    continue
+                hub = Hub()
+                try:
+                    if hub.query(CMD_STATUS)[14] == 0x08:
+                        break
+                finally:
+                    hub.close()
+                time.sleep(2)
+
+    def flash_jobs(self, _cache, pid, chips, versions, folders):
+        jobs = []
+        for chip in self.fw_flash_order:
+            if chip not in chips:
+                continue
+            folder, version = folders.get(chip), versions[chip]
+            if not folder:
+                raise RuntimeError("no firmware folder recorded; run 'arctis-omni firmware check'")
+            target = pid if chip.startswith("base") else folder_pid(folder)
+            if chip == "base DSP":
+                pattern, run = "_dsp_", lambda d, p, t=target, c=chip: npw_flash_dsp(t, d, p, c)
+            elif chip == "base MCU":
+                pattern, run = "_mcu_", lambda d, p, t=target, c=chip: npw_flash_mcu(t, (0x06, 0xEB), d, p, c)
+            elif chip == "headset MCU":
+                pattern, run = "_mcu_", lambda d, p, t=target, c=chip: npw_flash_mcu(t, (0x07, 0x2C, 0xEF), d, p, c)
+            else:
+                pattern, run = "_bt_", lambda d, p, t=target, c=chip: npw_flash_qcc(t, d, p, c)
+            jobs.append(FlashJob(chip, version, firmware_file(folder, pattern, version), target, run))
+        return jobs
 
 
 class NovaProWired(NovaProWireless):
@@ -160,9 +254,53 @@ class NovaProWired(NovaProWireless):
 
     fw_chips = ("DSP", "MCU", "USB")
     fw_bundles = {pid: {pid: ("DSP", "MCU", "USB")} for pid in (0x12CB, 0x12CD)}
+    fw_flash_order = ("USB", "DSP", "MCU")
     # Flashing is verified on the PC GameDAC only (all three chips, 2026-11-01).
     flashable = (0x12CB,)
     update_hint = "Update with SteelSeries GG on Windows, with the GameDAC connected by USB."
+
+    @staticmethod
+    def part_name(_pid):
+        return "GameDAC"
+
+    def recovery_version(self, cache, pid, chip):
+        return folder_versions(bundle_folder(cache, pid), self.fw_bundles[pid][pid]).get(chip)
+
+    @staticmethod
+    def flash_problem(_jobs):
+        found = len(gamedac_nodes())
+        if found != 1:
+            return f"Connect exactly one Arctis Nova Pro GameDAC while updating (found {found})."
+        return None
+
+    @staticmethod
+    def flash_ready(pid):
+        return hidraw_node(pid)
+
+    @staticmethod
+    def prepare_update(_device, chips):
+        return chips
+
+    @staticmethod
+    def after_flash(_jobs):
+        pass
+
+    @staticmethod
+    def flash_notes(_chips):
+        return ["Connect the GameDAC to this PC directly with its USB cable (not through a USB hub),\n"
+                "    with the headset plugged into the GameDAC.",
+                "Don't unplug anything until it says it's finished (about a minute).",
+                "Updating the MCU resets the GameDAC's settings (sidetone, EQ…) to their defaults."]
+
+    @staticmethod
+    def flash_jobs(cache, pid, chips, versions, folders):
+        jobs = []
+        for name, chip, pattern in BERENA_CHIPS:
+            if name in chips:
+                folder = folders.get(name) or bundle_folder(cache, pid)
+                jobs.append(FlashJob(name, versions[name], firmware_file(folder, pattern, versions[name]), pid,
+                                     lambda d, p, n=name, c=chip: berena_flash_chip(pid, n, c, d, p)))
+        return jobs
 
 
 MODELS = (Omni(), NovaProWireless(), NovaProWired())
@@ -644,6 +782,14 @@ def bundle_folder(cache, pid):
     return os.path.join(cache, "firmware", str((VENDOR << 16) | pid))
 
 
+def folder_pid(folder):
+    # GG names firmware folders after the device: (vendor << 16) | PID, in decimal.
+    try:
+        return int(os.path.basename(folder)) & 0xFFFF
+    except ValueError:
+        return 0
+
+
 def fetch_gg_firmware(version, url, md5, log):
     # Unpack only the firmware folders of supported devices from a GG release, once.
     cache = os.path.join(CACHE_DIR, f"gg-{version}")
@@ -745,6 +891,7 @@ def compare_device(state, hub):
         except (OSError, ValueError, KeyError):
             pass
     available = {chip: version for chip, (version, _folder) in bundle.items()}
+    folders = {chip: folder for chip, (_version, folder) in bundle.items()}
     updates = {chip: version for chip, version in available.items()
                if current.get(chip) and version_key(version) > version_key(current[chip])}
     state["device"] = {
@@ -753,6 +900,7 @@ def compare_device(state, hub):
         "current": current,
         "available": available,
         "updates": updates,
+        "folders": folders,
         "flashable": hub.pid in hub.model.flashable,
     }
     return state
@@ -908,6 +1056,308 @@ def berena_flash_chip(app_pid, chip_name, chip, data, progress):
             link.close()
 
 
+# Arctis Nova Pro Wireless update protocol: see the README. App PID → bootloader PID, for
+# the base stations and for the headsets (which are updated over their own USB cable).
+NPW_BOOT_PIDS = {0x12E0: 0x12E1, 0x12E5: 0x12E7, 0x225D: 0x225F,
+                 0x12E2: 0x12E3, 0x12E8: 0x12E9, 0x2240: 0x2241, 0x2242: 0x2243, 0x2260: 0x2261}
+NPW_BASE_PIDS = (0x12E0, 0x12E5, 0x225D)
+NPW_MCU_BLOCK = 1012
+NPW_DSP_BLOCK = 512
+NPW_QCC_CHUNK = 0xF4
+
+
+def debug(*args):
+    if os.environ.get("ARCTIS_OMNI_DEBUG"):
+        say("\n  [debug]", *args)
+
+
+def vendor_nodes(pid, report):
+    # hidraw nodes of a device whose vendor-defined collection carries this report ID.
+    nodes = []
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(f"{node}/device/uevent") as f:
+                if f"HID_ID=0003:{VENDOR:08X}:{pid:08X}" not in f.read().upper():
+                    continue
+            with open(f"{node}/device/report_descriptor", "rb") as f:
+                desc = f.read()
+        except OSError:
+            continue
+        if desc[:1] == b"\x06" and desc[2:3] == b"\xff" and bytes([0x85, report]) in desc:
+            nodes.append("/dev/" + os.path.basename(node))
+    return nodes
+
+
+def wait_for_node(pid, report, timeout):
+    deadline = time.time() + timeout
+    while not (nodes := vendor_nodes(pid, report)):
+        if time.time() > deadline:
+            return None
+        time.sleep(0.05)
+    return nodes[0]
+
+
+class HidLink:
+    def __init__(self, path, report):
+        # udev hands the node to the logged-in user a moment after it appears.
+        deadline = time.time() + 5
+        while True:
+            try:
+                self.fd = os.open(path, os.O_RDWR)
+                break
+            except (PermissionError, FileNotFoundError):
+                if time.time() > deadline:
+                    raise RuntimeError(f"can't open {path}; install the udev rule (./install.sh)")
+                time.sleep(0.05)
+        self.report = report
+
+    def close(self):
+        os.close(self.fd)
+
+    def out(self, *payload):
+        os.write(self.fd, bytes([self.report, *payload]).ljust(64, b"\0"))
+
+    def feature(self, payload, size):
+        buf = bytearray(bytes([self.report, *payload]).ljust(size, b"\0"))
+        fcntl.ioctl(self.fd, (3 << 30) | (size << 16) | (ord("H") << 8) | 0x06, buf)  # HIDIOCSFEATURE
+
+    def read(self, timeout):
+        if not select.select([self.fd], [], [], max(0, timeout))[0]:
+            return None
+        reply = os.read(self.fd, 64)
+        debug("<", reply[:8].hex(" "))
+        return reply
+
+    def pending(self):
+        replies = []
+        while (reply := self.read(0)) is not None:
+            replies.append(reply)
+        return replies
+
+    def reply(self, key, timeout, what):
+        # The next report starting with `key` (report ID and command bytes); event
+        # reports on the same interface are skipped.
+        deadline = time.time() + timeout
+        while (reply := self.read(deadline - time.time())) is not None:
+            if reply.startswith(bytes(key)):
+                return reply
+        raise RuntimeError(f"{what}: no answer")
+
+    def command(self, payload, expect, timeout, what):
+        self.out(*payload)
+        expect = bytes(expect)
+        reply = self.reply(expect[:3], timeout, what)
+        if not reply.startswith(expect):
+            raise RuntimeError(f"{what}: the device answered {reply[:6].hex(' ')}")
+        return reply
+
+
+def parse_intel_hex(data):
+    # [(address, bytes)] like GG builds them: a record extends the current region when it
+    # continues where the last one ended, otherwise it starts a new one.
+    regions, base, start, end = {}, 0, None, None
+    for number, line in enumerate(data.decode("ascii").splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        rec = bytes.fromhex(line[1:]) if line.startswith(":") else b""
+        if len(rec) < 5 or len(rec) != rec[0] + 5 or sum(rec) & 0xFF:
+            raise RuntimeError(f"firmware file: bad record on line {number}")
+        kind, payload = rec[3], rec[4:-1]
+        if kind == 0:
+            address = base + int.from_bytes(rec[1:3], "big")
+            if start is None or address != end:
+                start = address
+                regions.setdefault(start, bytearray())
+            regions[start] += payload
+            end = address + len(payload)
+        elif kind == 1:
+            break
+        elif kind == 2:
+            base = int.from_bytes(payload, "big") << 4
+        elif kind == 4:
+            base = int.from_bytes(payload, "big") << 16
+    out = sorted(regions.items())
+    if not out or any(a + len(d) > b for (a, d), (b, _) in zip(out, out[1:])):
+        raise RuntimeError("firmware file: no data or overlapping data")
+    return out
+
+
+def parse_qcc_upgrade(data):
+    # Qualcomm upgrade file: an APPUHDR5 header, PARTDATA records (SQIF, partition number,
+    # first word, data) and an APPUPFTR footer (the image signature).
+    parts, footer, header, pos = [], None, None, 0
+    while pos < len(data):
+        tag, size = data[pos:pos + 8], int.from_bytes(data[pos + 8:pos + 12], "big")
+        body = data[pos + 12:pos + 12 + size]
+        if len(body) != size:
+            raise RuntimeError("firmware file is truncated")
+        if tag == b"APPUHDR5":
+            header = body
+        elif tag == b"PARTDATA" and size >= 8:
+            parts.append((int.from_bytes(body[2:4], "big"), body[4:8], body[8:]))
+        elif tag == b"APPUPFTR":
+            footer = body
+        else:
+            raise RuntimeError(f"firmware file: unexpected {tag!r} record")
+        pos += 12 + size
+    if header is None or not parts or not footer:
+        raise RuntimeError("not a Qualcomm upgrade file")
+    return parts, footer
+
+
+def xor(data):
+    x = 0
+    for b in data:
+        x ^= b
+    return x
+
+
+def npw_flash_dsp(app_pid, data, progress, name):
+    blocks = [(o, data[o:o + NPW_DSP_BLOCK]) for o in range(0, len(data), NPW_DSP_BLOCK)]
+    blocks = [(o, d) for o, d in blocks if d != b"\xff" * len(d)]  # blank space isn't sent
+    node = next(iter(vendor_nodes(app_pid, 0x06)), None)
+    if not node:
+        raise RuntimeError("the base station isn't connected")
+    link = HidLink(node, 0x06)
+    try:
+        link.pending()
+        link.out(0x1B, 0xF1)
+        deadline = time.time() + 120
+        while True:  # the DSP is ready when it reports 03
+            reply = link.read(deadline - time.time())
+            if reply is None:
+                raise RuntimeError("the DSP didn't get ready for the update")
+            if reply[0] == 0x06 and reply[3] == 0x03:
+                break
+        for n, (offset, chunk) in enumerate(blocks, 1):
+            link.feature(bytes([0x1B, 0xF4]) + (0x70000000 + offset).to_bytes(4, "big") + chunk, 1024)
+            reply = link.reply((0x06, 0xB1, 0xF3), 10, f"{name} block at {offset:#x}")
+            if reply[3] != 0:
+                raise RuntimeError(f"{name} block at {offset:#x}: the device answered {reply[:6].hex(' ')}")
+            progress(name, n, len(blocks))
+    finally:
+        try:
+            link.out(0x1B, 0xEE)  # ends the update, also after a failure (as GG does)
+        except OSError:
+            pass
+        link.close()
+    # That restarts the base station; wait for it before anything else talks to it.
+    gone = time.time() + 5
+    while vendor_nodes(app_pid, 0x06) and time.time() < gone:
+        time.sleep(0.05)
+    if not wait_for_node(app_pid, 0x06, 30):
+        raise RuntimeError(f"the base station didn't come back after its {name} update")
+
+
+def npw_flash_mcu(app_pid, enter, data, progress, name):
+    regions = parse_intel_hex(data)
+    blocks = [(start + o, chunk[o:o + NPW_MCU_BLOCK])
+              for start, chunk in regions for o in range(0, len(chunk), NPW_MCU_BLOCK)]
+    boot_pid = NPW_BOOT_PIDS[app_pid]
+    boot = next(iter(vendor_nodes(boot_pid, 0x06)), None)
+    entered = not boot
+    if entered:
+        app = next(iter(vendor_nodes(app_pid, enter[0])), None)
+        if not app:
+            raise RuntimeError(f"the device for the {name} isn't connected")
+        link = HidLink(app, enter[0])
+        try:
+            link.out(*enter[1:])
+        finally:
+            link.close()
+        boot = wait_for_node(boot_pid, 0x06, 30)
+        if not boot:
+            raise RuntimeError("the bootloader didn't appear")
+    link = HidLink(boot, 0x06)
+    try:
+        if entered:
+            # Without this the bootloader goes back to the old firmware after 5 s. (One
+            # left in its bootloader by an interrupted update stays there anyway.)
+            link.out(0xB0)
+        for n, (address, block) in enumerate(blocks, 1):
+            link.feature(bytes([0xA1]) + address.to_bytes(4, "big") + len(block).to_bytes(2, "big")
+                         + zlib.crc32(block).to_bytes(4, "big") + block, 1024)
+            # GG streams without waiting (each block is a control transfer the bootloader
+            # has to accept); still stop on an error the bootloader reports.
+            for reply in link.pending():
+                if reply[:2] == b"\x06\xa1" and reply[2] in (1, 2, 3):
+                    raise RuntimeError(f"{name} block at {address:#x}: the bootloader answered "
+                                       f"{reply[:4].hex(' ')}")
+            progress(name, n, len(blocks))
+    finally:
+        try:
+            link.out(0xBB)  # leave the bootloader, also after a failure (as GG does)
+        except OSError:
+            pass
+        link.close()
+    if not wait_for_node(app_pid, enter[0], 60):
+        raise RuntimeError(f"the device didn't come back after its {name} update")
+
+
+def npw_flash_qcc(app_pid, data, progress, name):
+    parts, footer = parse_qcc_upgrade(data)
+    node = next(iter(vendor_nodes(app_pid, 0x07)), None)
+    if not node:
+        raise RuntimeError("the headset isn't connected by USB")
+    link = HidLink(node, 0x07)
+    total, done = sum(len(d) for _p, _w, d in parts) + len(footer), 0
+
+    def stream(op, payload, what):
+        nonlocal done
+        for o in range(0, len(payload), NPW_QCC_CHUNK):
+            chunk = payload[o:o + NPW_QCC_CHUNK]
+            link.feature(bytes([0x2E, len(chunk) + 4, op, len(chunk)]) + chunk + bytes([xor(chunk)]), 0xFA)
+            reply = link.reply((0x07, 0xE2, op), 20, what)
+            if reply[3] != 0x01:
+                raise RuntimeError(f"{what}: the headset answered {reply[:6].hex(' ')}")
+            done += len(chunk)
+            progress(name, done, total)
+
+    try:
+        link.pending()
+        link.command((0x02, 0x01), (0x07, 0xE2, 0xE5, 0x03, 0xF0), 20, "start")
+        time.sleep(5)
+        link.command((0x2E, 0x02, 0xF0, 0x00), (0x07, 0xE2, 0xF0, 0x01), 20, "begin")
+        for part, first, payload in parts:
+            link.out(0x2E, 0x08, 0xF1, part >> 8, part & 0xFF, *first)
+            reply = link.reply((0x07, 0xE2, 0xF1), 5, f"partition {part}")
+            if reply[3] == 0x00:
+                raise RuntimeError(f"partition {part}: the headset refused it")
+            if reply[3] != 0x01:
+                debug(f"partition {part} skipped by the headset")  # as GG does
+                done += len(payload)
+                continue
+            stream(0xF2, payload, f"partition {part}")
+            link.command((0x2E, 0x02, 0xF3), (0x07, 0xE2, 0xF3, 0x01), 5, f"partition {part} end")
+        link.command((0x2E, 0x06, 0xF8, *len(footer).to_bytes(4, "big")), (0x07, 0xE2, 0xF8, 0x01), 5,
+                     "signature")
+        stream(0xF9, footer, "signature")
+        ids = bytes(part & 0xFF for part, _w, _d in parts)
+        link.feature(bytes([0x2E, len(ids) + 4, 0xFA, len(ids)]) + ids + bytes([xor(ids)]), 0xFA)
+        reply = link.reply((0x07, 0xE2, 0xFA), 5, "partition list")
+        if reply[3] != 0x01:
+            raise RuntimeError(f"partition list: the headset answered {reply[:6].hex(' ')}")
+        say(f"\r  {name}: installing…" + " " * 20, end="", flush=True)
+        link.command((0x2E, 0x02, 0xF4), (0x07, 0xE2, 0xF4, 0x01), 30, "install")
+        link.command((0x2E, 0x02, 0xF5), (0x07, 0xE2, 0xF5, 0x01), 5, "commit")
+        time.sleep(3)
+        for _attempt in range(16):  # F0 = still busy
+            link.out(0x2C, 0xE4, 0x02, 0x00)
+            reply = link.reply((0x07, 0xC2, 0xE4), 5, "install status")
+            if not reply.startswith(b"\x07\xc2\xe4\x03\xf0"):
+                break
+            time.sleep(1)
+        if reply[4] == 0xF0:
+            raise RuntimeError("the headset didn't finish installing the update")
+        link.command((0x02, 0x01), (0x07, 0xE2, 0xE5, 0x03, 0xF0), 20, "restart")
+        link.command((0x2E, 0x02, 0xF6), (0x07, 0xE2, 0xF6, 0x01), 20, "finish")
+        link.command((0x2E, 0x02, 0xF7), (0x07, 0xE2, 0xF7, 0x01), 20, "finish")
+        link.out(0x2C, 0xFF)
+    finally:
+        link.close()
+
+
 def firmware_file(folder, pattern, version):
     for path in glob.glob(os.path.join(folder, "*")):
         name = os.path.basename(path)
@@ -970,32 +1420,79 @@ class FlashSignals:
         raise FlashInterrupted("stopped by SIGTERM")
 
 
+def folder_versions(folder, chips):
+    # {chip: version} from a GG firmware folder's version.json (chips in its order).
+    try:
+        with open(os.path.join(folder, "version.json")) as f:
+            versions = json.load(f)["firmware_version"].split("/")
+    except (OSError, ValueError, KeyError):
+        return {}
+    return dict(zip(chips, versions))
+
+
 def gamedac_nodes():
     # Command nodes of every connected GameDAC we can flash, in app or bootloader mode.
     pids = (*BERENA_BOOT_PIDS, *BERENA_BOOT_PIDS.values())
     return [node for pid in pids for node in hidraw_nodes(pid)]
 
 
-def bootloader_app_pid():
-    # App PID of a GameDAC that's sitting in its bootloader (an interrupted update), if any.
-    return next((app for app, boot in BERENA_BOOT_PIDS.items() if hidraw_node(boot)), None)
+def npw_base_nodes():
+    return [node for pid in NPW_BASE_PIDS for node in vendor_nodes(pid, 0x06)
+            + vendor_nodes(NPW_BOOT_PIDS[pid], 0x06)]
 
 
-def run_flash(state, app_pid, chips, versions):
-    # Flash the given (name, chip id, file pattern) chips. True on success.
-    found = len(gamedac_nodes())
-    if found != 1:
-        say(f"Connect exactly one Arctis Nova Pro GameDAC while updating (found {found}).")
-        return False
+def npw_headset_nodes(pid):
+    return vendor_nodes(pid, 0x07) + vendor_nodes(NPW_BOOT_PIDS[pid], 0x06)
+
+
+def stuck_bootloader():
+    # (model, app PID, chip) of a device sitting in its bootloader: an interrupted update.
+    for app, boot in BERENA_BOOT_PIDS.items():
+        if hidraw_node(boot):
+            return MODELS[2], app, "USB"
+    # A Nova Pro Wireless bootloader with good firmware behind it leaves by itself after
+    # 5 s, so only report one that's still there after that.
+    def in_bootloader():
+        return [app for app, boot in NPW_BOOT_PIDS.items() if vendor_nodes(boot, 0x06)]
+
+    if not in_bootloader():
+        return None
+    time.sleep(6)
+    found = in_bootloader()
+    if not found:
+        return None
+    app = found[0]
+    return MODELS[1], app, "base MCU" if app in NPW_BASE_PIDS else "headset MCU"
+
+
+class FlashJob:
+    # One chip's update: `run(data, progress)` writes it to the device with PID `pid`.
+    def __init__(self, chip, version, path, pid, run):
+        self.chip, self.version, self.path, self.pid, self.run = chip, version, path, pid, run
+
+    def load(self):
+        with open(self.path, "rb") as f:
+            self.data = f.read()
+
+
+def read_jobs(jobs):
     # Read every image first, so a cache change can't pull a file away mid-update.
-    images = []
     try:
-        for chip_name, chip, pattern in chips:
-            version = versions[chip_name]
-            with open(firmware_file(bundle_folder(state["cache"], app_pid), pattern, version), "rb") as f:
-                images.append((chip_name, chip, version, f.read()))
-    except (RuntimeError, OSError) as e:
+        for job in jobs:
+            job.load()
+    except OSError as e:
         say(f"Couldn't read the firmware files: {e}")
+        return False
+    return True
+
+
+def run_flash(model, app_pid, jobs):
+    # Write the jobs' firmware. True on success.
+    problem = model.flash_problem(jobs)
+    if problem:
+        say(problem)
+        return False
+    if not read_jobs(jobs):
         return False
     if not acquire_flash_lock():
         say("Another firmware update is already running.")
@@ -1013,25 +1510,25 @@ def run_flash(state, app_pid, chips, versions):
             if was_active:
                 subprocess.run(["systemctl", "--user", "stop", service], check=False)
             time.sleep(2)
-            for chip_name, chip, version, data in images:
-                say(f"Writing {chip_name} firmware {version}…")
-                berena_flash_chip(app_pid, chip_name, chip, data, progress)
+            for job in jobs:
+                say(f"Writing {job.chip} firmware {job.version}…")
+                job.run(job.data, progress)
                 say(" done")
                 time.sleep(2)
         except (RuntimeError, OSError) as e:
             failed = e
         finally:
             release_flash_lock()
-            # Let the GameDAC finish rebooting before anything talks to it again.
-            deadline = time.time() + 20
-            while not hidraw_node(app_pid) and time.time() < deadline:
+            # Let the device finish rebooting before anything talks to it again.
+            deadline = time.time() + 30
+            while not model.flash_ready(app_pid) and time.time() < deadline:
                 time.sleep(0.5)
             time.sleep(3)
             if was_active:
                 subprocess.run(["systemctl", "--user", "start", service], check=False)
     if failed:
         say(f"\n\nThe update FAILED: {failed}")
-        say("Leave the GameDAC connected and run the update again. If it was left in its "
+        say("Leave everything connected and run the update again. If a part was left in its "
             "bootloader, the updater will offer to recover it.")
         return False
     return True
@@ -1055,37 +1552,50 @@ def ask(prompt, answer):
         return False
 
 
+def recover(state, model, app_pid, chip):
+    version = model.recovery_version(state["cache"], app_pid, chip)
+    print(f"An {model.name} {model.part_name(app_pid)} is in its bootloader: a firmware update "
+          "was interrupted.")
+    if not version:
+        print("No firmware for it in the cached SteelSeries GG release; check your connection and retry.")
+        return pause()
+    print(f"Re-installing its {chip} firmware ({version}) brings it back.\n")
+    if not ask("Type 'recover' to start: ", "recover"):
+        return print("Cancelled; nothing was changed.")
+    try:
+        jobs = model.flash_jobs(state["cache"], app_pid, [chip], {chip: version},
+                                {chip: bundle_folder(state["cache"], app_pid)})
+    except RuntimeError as e:
+        print(f"Can't recover it: {e}")
+        return pause()
+    if not run_flash(model, app_pid, jobs):
+        return pause()
+    print("\nRecovered.")
+    refresh_device(state)
+    if state.get("device"):
+        show_versions(state["device"])
+        if state["device"]["updates"]:
+            print("Run the update again to install the rest.")
+    return pause()
+
+
 def cmd_firmware_update(_args):
     print(f"Arctis firmware update (arctis-omni {VERSION})\n")
+    if flash_lock_holder():
+        print("Another firmware update is running; let it finish first.")
+        return pause()
     try:
         state = firmware_check()
     except Exception as e:
         print(f"Couldn't check for firmware: {e}")
         # Recovering an interrupted update can still use an earlier check's files.
         state = load_firmware_state()
-        if not (state.get("cache") and bootloader_app_pid()):
+        if not state.get("cache"):
             return pause()
 
-    recovering = bootloader_app_pid()
-    if recovering:
-        model = next(m for m in MODELS if recovering in m.pids)
-        usb = bundle_versions(state["cache"], model, recovering).get("USB", (None,))[0]
-        print(f"An {model.name} GameDAC is in its bootloader: a firmware update was interrupted.")
-        if not usb:
-            print("No USB firmware for it in the cached SteelSeries GG release; check your connection and retry.")
-            return pause()
-        print(f"Re-installing its USB firmware ({usb}) brings it back.\n")
-        if not ask("Type 'recover' to start: ", "recover"):
-            return print("Cancelled; nothing was changed.")
-        if not run_flash(state, recovering, [BERENA_CHIPS[0]], {"USB": usb}):
-            return pause()
-        print("\nRecovered.")
-        refresh_device(state)
-        if state.get("device"):
-            show_versions(state["device"])
-            if state["device"]["updates"]:
-                print("Run the update again to install the rest.")
-        return pause()
+    stuck = stuck_bootloader()
+    if stuck:
+        return recover(state, *stuck)
 
     while not state.get("device") or not find_hub():
         print("Connect your headset's base station or GameDAC to this PC with its USB cable.")
@@ -1098,25 +1608,39 @@ def cmd_firmware_update(_args):
     print(f"{device['model']}, firmware from SteelSeries GG {state['gg_version']}:")
     show_versions(device)
     model = next(m for m in MODELS if m.name == device["model"])
+    pid = int(device["pid"], 16)
     if not device["flashable"]:
         print("Updating this model from Linux isn't supported yet.")
         print(model.update_hint)
         return pause()
-    chips = [c for c in BERENA_CHIPS if c[0] in device["updates"]]
+    chips = [c for c in model.fw_flash_order if c in device["updates"]]
     if not chips:
         print("Everything is up to date.")
         if not ask("Re-install the current firmware anyway? Type 'reinstall' to do so: ", "reinstall"):
             return
-        chips = list(BERENA_CHIPS)
+        # Only parts whose installed version GG ships; reinstalling never downgrades.
+        chips = [c for c in model.fw_flash_order
+                 if device["available"].get(c) and device["current"].get(c) == device["available"][c]]
+        skipped = [c for c in model.fw_flash_order if c not in chips and device["current"].get(c)]
+        if skipped:
+            print(f"Leaving out {', '.join(skipped)}: the installed version isn't the one GG ships.")
+    chips = model.prepare_update(device, chips)
+    if not chips:
+        return print("Nothing to update; nothing was changed.")
+    try:
+        jobs = model.flash_jobs(state["cache"], pid, chips, device["available"], device.get("folders", {}))
+    except (RuntimeError, KeyError) as e:
+        print(f"Can't update: {e}")
+        return pause()
     print("Before starting:")
-    print("  • Connect the GameDAC to this PC directly with its USB cable (not through a USB hub),")
-    print("    with the headset plugged into the GameDAC.")
-    print("  • Don't unplug anything until it says it's finished (about a minute).")
-    print("  • Updating the MCU resets the GameDAC's settings (sidetone, EQ…) to their defaults.\n")
+    for line in model.flash_notes(chips):
+        print(f"  • {line}")
+    print()
     if not ask("Type 'update' to start: ", "update"):
         return print("Cancelled; nothing was changed.")
-    if not run_flash(state, int(device["pid"], 16), chips, device["available"]):
+    if not run_flash(model, pid, jobs):
         return pause()
+    model.after_flash(jobs)
     refresh_device(state)
     say("\nFinished. Firmware now:")
     if state.get("device"):
