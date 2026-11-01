@@ -42,6 +42,9 @@ install_if_changed pipewire/60-arctis-omni-chatmix.conf "$PIPEWIRE_DIR/60-arctis
 
 service_changed=0
 install_if_changed systemd/arctis-omni-chatmix.service "$SYSTEMD_DIR/arctis-omni-chatmix.service" 644 && service_changed=1
+# Daily firmware check (a no-op on the timer if nothing changed).
+install_if_changed systemd/arctis-omni-firmware-check.service "$SYSTEMD_DIR/arctis-omni-firmware-check.service" 644 || true
+install_if_changed systemd/arctis-omni-firmware-check.timer "$SYSTEMD_DIR/arctis-omni-firmware-check.timer" 644 || true
 
 # The widget needs the tool's absolute path: plasmashell's PATH may not include ~/.local/bin.
 staged=$(mktemp -d)
@@ -56,7 +59,8 @@ if ! diff -rq "$staged" "$PLASMOID_DIR" >/dev/null 2>&1; then
 fi
 
 if [ "$pipewire_changed" = 1 ]; then
-    echo "Restarting PipeWire to load the Game/Chat sinks (audio drops for a moment)..."
+    echo "Restarting PipeWire to load the Game/Chat sinks (audio drops for a moment;"
+    echo "Discord voice stays silent until you rejoin the channel)..."
     systemctl --user restart pipewire pipewire-pulse wireplumber
     sleep 2
 fi
@@ -69,6 +73,9 @@ if systemctl --user is-active --quiet arctis-omni-chatmix.service; then
 else
     systemctl --user enable --now arctis-omni-chatmix.service
 fi
+systemctl --user enable --now arctis-omni-firmware-check.timer >/dev/null 2>&1 \
+    || echo "  - Couldn't enable the daily firmware check (arctis-omni-firmware-check.timer)."
+command -v 7z >/dev/null || echo "  - Install 7zip (7z) so the firmware check can read SteelSeries GG releases."
 
 echo "Installed."
 # The service and widget use absolute paths; only interactive use of the CLI needs PATH.

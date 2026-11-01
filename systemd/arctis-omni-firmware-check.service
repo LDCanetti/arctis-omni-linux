@@ -1,0 +1,7 @@
+[Unit]
+Description=Check SteelSeries GG for Arctis headset firmware updates
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/arctis-omni firmware check --notify

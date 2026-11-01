@@ -52,6 +52,7 @@ On the wired Nova Pro it shows only what that headset has:
   arctis-omni transparency-level 1-10    # wireless models
   arctis-omni sidetone on|off|<level>   # Omni 1-10, Nova Pro Wireless / wired 1-3
   arctis-omni output [headset|<sink>]   # where Arctis Game/Chat play (see below)
+  arctis-omni firmware check|update     # firmware updates (see below)
   ```
 - **ChatMix**: a user service plus PipeWire config that adds two outputs, **Arctis Game**
   and **Arctis Chat**. The service routes both to whichever supported headset is
@@ -193,8 +194,28 @@ Nova Pro Wireless. The `BD` and `B9` writes were found to work on it by testing,
 
 ## Firmware updates
 
-Firmware isn't updated from Linux. Use SteelSeries GG on Windows. For the Omni, GG's updater
-only starts with **both the GameHub and the headset connected to the PC by USB cable**.
+SteelSeries publishes headset firmware only inside SteelSeries GG releases. A daily timer
+(`arctis-omni-firmware-check.timer`) asks SteelSeries' download link which GG version is
+current. When a new one appears, it downloads that installer once (about 400 MB), keeps only
+the firmware for supported headsets in `~/.cache/arctis-omni` (about 20 MB), and compares it
+with what the connected headset reports. If anything is newer, you get a desktop
+notification, and the widget shows **Update available** with an **Update…** button.
+
+```sh
+arctis-omni firmware check    # check now
+arctis-omni firmware update   # the interactive updater (the widget's button opens it in a terminal)
+```
+
+| Model | Update from Linux |
+|---|---|
+| Arctis Nova Pro (wired, PC GameDAC `12cb`) | ✅ USB, DSP and MCU chips, the same way GG does it. Verified by re-flashing all three. Updating the MCU resets the GameDAC's settings to their defaults. |
+| Arctis Nova Pro (wired, Xbox GameDAC `12cd`) | Check only. Same method, but untested; update with GG. |
+| Arctis Nova Pro Omni | Check only; update with GG on Windows. GG's updater only starts with **both the GameHub and the headset connected to the PC by USB cable**. |
+| Arctis Nova Pro Wireless | Check only; update with GG on Windows. |
+
+For models that are check-only, the Update button explains how to update with GG instead of
+flashing. While the updater writes firmware it pauses the ChatMix service and holds a lock,
+so the widget and other commands leave the device alone.
 
 On Omni firmware 1.32.0, the knob only enters ChatMix mode if software ChatMix is enabled
 *before* Sonar present, after both have been cleared. The service does this, and waits 5 s

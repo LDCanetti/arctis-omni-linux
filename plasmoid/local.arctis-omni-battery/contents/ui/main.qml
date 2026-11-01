@@ -25,7 +25,8 @@ PlasmoidItem {
     }
 
     toolTipMainText: status ? status.model : "Arctis headset"
-    toolTipSubText: error !== "" ? error
+    toolTipSubText: status && status.firmware && status.firmware.update_available ? "Firmware update available"
+        : error !== "" ? error
         : hasBattery ? "Headset " + status.battery + "% · spare " + status.charger_battery + "%"
         : connected ? "Wired headset"
         : "Headset not connected"
@@ -189,6 +190,25 @@ PlasmoidItem {
             PlasmaComponents.Label {
                 Kirigami.FormData.label: "ChatMix:"
                 text: root.status ? "Game " + root.status.chatmix_game + "% · Chat " + root.status.chatmix_chat + "%" : ""
+            }
+            // From the daily firmware check (null until it has run with this headset connected).
+            RowLayout {
+                visible: root.status !== null && root.status.firmware !== null
+                Kirigami.FormData.label: "Firmware:"
+                PlasmaComponents.Label {
+                    readonly property var fw: root.status ? root.status.firmware : null
+                    text: !fw ? "" : fw.update_available ? "Update available" : "Up to date"
+                    color: fw && fw.update_available ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.textColor
+                }
+                PlasmaComponents.Button {
+                    visible: root.status !== null && root.status.firmware !== null && root.status.firmware.update_available
+                    text: "Update…"
+                    icon.name: "system-software-update"
+                    onClicked: {
+                        root.run("firmware open");
+                        root.expanded = false;
+                    }
+                }
             }
         }
 

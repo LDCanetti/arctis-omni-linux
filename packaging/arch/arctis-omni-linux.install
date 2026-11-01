@@ -2,6 +2,7 @@ post_install() {
     cat <<'EOF'
 ==> arctis-omni-linux: to finish setting up, as your normal user:
       systemctl --user enable --now arctis-omni-chatmix.service
+      systemctl --user enable --now arctis-omni-firmware-check.timer
       systemctl --user restart pipewire    # loads the Arctis Game / Arctis Chat outputs
     Then replug the base station so the udev rule applies, set your default output to
     "Arctis Game" and your voice app's output to "Arctis Chat", and add the
@@ -22,8 +23,9 @@ EOF
 post_remove() {
     cat <<'EOF'
 ==> arctis-omni-linux: as your normal user, stop the service and reload PipeWire:
-      systemctl --user stop arctis-omni-chatmix.service
-      rm -f ~/.config/systemd/user/default.target.wants/arctis-omni-chatmix.service
+      systemctl --user stop arctis-omni-chatmix.service arctis-omni-firmware-check.timer
+      rm -f ~/.config/systemd/user/default.target.wants/arctis-omni-chatmix.service \
+            ~/.config/systemd/user/timers.target.wants/arctis-omni-firmware-check.timer
       systemctl --user daemon-reload
       systemctl --user restart pipewire
 EOF
