@@ -280,23 +280,29 @@ def set_volume(sink, percent):
     return result.returncode == 0
 
 
-def route_outputs(product):
-    # Point the Game/Chat loopbacks at this headset's ALSA sink via PipeWire's routing
-    # metadata, so the same sinks follow whichever base station is connected.
+def find_sink(product):
+    # The connected headset's ALSA sink. Its name changes with the card profile (e.g.
+    # analog-stereo vs. pro-output-0), so callers re-check it rather than caching it.
     if not product:
-        return False
+        return None
     try:
         sinks = subprocess.run(["pactl", "list", "short", "sinks"], check=True,
                                capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    # The trailing "-" keeps "Arctis Nova Pro" from matching "Arctis Nova Pro Wireless/Omni".
+    prefix = "alsa_output.usb-SteelSeries_" + product.replace(" ", "_") + "-"
+    return next((line.split("\t")[1] for line in sinks.splitlines()
+                 if line.split("\t")[1:2] and line.split("\t")[1].startswith(prefix)), None)
+
+
+def route_outputs(target):
+    # Point the Game/Chat loopbacks at this sink via PipeWire's routing metadata, so the
+    # same sinks follow whichever headset is connected.
+    try:
         dump = json.loads(subprocess.run(["pw-dump"], check=True, capture_output=True,
                                          text=True).stdout)
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-        return False
-    # The trailing "-" keeps "Arctis Nova Pro" from matching "Arctis Nova Pro Wireless/Omni".
-    prefix = "alsa_output.usb-SteelSeries_" + product.replace(" ", "_") + "-"
-    target = next((line.split("\t")[1] for line in sinks.splitlines()
-                   if line.split("\t")[1:2] and line.split("\t")[1].startswith(prefix)), None)
-    if not target:
         return False
     ids = {o["info"]["props"].get("node.name"): o["id"] for o in dump
            if o.get("type") == "PipeWire:Interface:Node" and o.get("info")}
@@ -342,7 +348,9 @@ def cmd_chatmix_daemon(_hub, _args):
             # succeed (hub still starting up, sinks not up yet, PipeWire restarting). Until
             # the dial position is known the volumes are left alone rather than zeroed.
             mix = None
-            routed = applied = False
+            applied = False
+            routed_to = None
+            next_route_check = 0.0
             while not stop:
                 if mix is None:
                     a = hub.settings()
@@ -350,10 +358,15 @@ def cmd_chatmix_daemon(_hub, _args):
                         mix = (a["chatmix_game"], a["chatmix_chat"])
                         applied = False
                         print(f"dial at game {mix[0]}% chat {mix[1]}%", flush=True)
-                if not routed:
-                    routed = route_outputs(hub.product)
-                    if routed:
-                        print(f"game/chat outputs routed to {hub.product}", flush=True)
+                if time.monotonic() >= next_route_check:
+                    target = find_sink(hub.product)
+                    if target and target != routed_to and route_outputs(target):
+                        routed_to = target
+                        print(f"game/chat outputs routed to {target}", flush=True)
+                    # Retry every second until routed, then re-check every 10 s in case the
+                    # sink was renamed (card profile change).
+                    settled = target is not None and target == routed_to
+                    next_route_check = time.monotonic() + (10 if settled else 1)
                 if mix is not None and not applied:
                     applied = set_volume(GAME_SINK, mix[0]) & set_volume(CHAT_SINK, mix[1])
                 d = hub.read(1.0)

@@ -76,6 +76,10 @@ Then:
    affected by the dial.
 2. Add **Arctis Headset Battery** to a panel (right-click the panel → Add Widgets).
 
+The CLI is installed to `~/.local/bin`. If your shell doesn't already have that on `PATH`
+(stock Arch bash doesn't), `install.sh` says so; add `export PATH="$HOME/.local/bin:$PATH"`
+to `~/.bashrc` or `~/.zshrc`. The service and widget don't need it.
+
 `./uninstall.sh` removes everything and puts the hub back into hardware ChatMix mode.
 
 ## How ChatMix works
