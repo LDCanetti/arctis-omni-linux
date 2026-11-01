@@ -228,7 +228,8 @@ PlasmoidItem {
             readonly property bool hasNoiseControl: root.connected && st.anc_writable
             // One strength slider for the active noise mode; none when it's off. The ANC level
             // only exists on models that report it (anc_level is null otherwise).
-            readonly property bool showAncLevel: noiseMode === "anc" && st !== null && st.anc_level !== null
+            // Hidden with the mode buttons while the headset is off.
+            readonly property bool showAncLevel: noiseMode === "anc" && hasNoiseControl && st.anc_level !== null
             readonly property bool showTransparencyLevel: noiseMode === "transparency" && hasNoiseControl
             readonly property var firmware: st ? st.firmware : null
 
@@ -250,22 +251,30 @@ PlasmoidItem {
                         wrapMode: Text.Wrap
                         Layout.fillWidth: true
                     }
+                    // The spare battery charges in the base station, so it's reported
+                    // whether or not the headset is on.
                     RowLayout {
-                        visible: root.hasBattery
+                        visible: popup.st !== null && popup.st.wireless
                         spacing: Kirigami.Units.gridUnit
                         BatteryReadout {
+                            visible: root.hasBattery
                             percent: root.hasBattery ? popup.st.battery : 0
                             charging: root.hasBattery && popup.st.charging
                             what: popup.st && popup.st.charging ? "headset, charging" : "headset"
                         }
+                        PlasmaComponents.Label {
+                            visible: !root.hasBattery
+                            text: "Headset off"
+                            opacity: 0.7
+                        }
                         BatteryReadout {
-                            percent: root.hasBattery ? popup.st.charger_battery : 0
+                            percent: popup.st && popup.st.charger_battery !== null ? popup.st.charger_battery : 0
                             what: "spare"
                         }
                     }
                     PlasmaComponents.Label {
-                        visible: popup.st !== null && !root.hasBattery
-                        text: root.connected ? "Wired headset" : "Headset not connected"
+                        visible: popup.st !== null && !popup.st.wireless
+                        text: "Wired headset"
                         opacity: 0.7
                     }
                 }
