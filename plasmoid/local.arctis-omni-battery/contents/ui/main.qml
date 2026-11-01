@@ -22,7 +22,8 @@ PlasmoidItem {
     toolTipMainText: status ? status.model : "Arctis headset"
     toolTipSubText: status && status.firmware && status.firmware.update_available ? "Firmware update available"
         : error !== "" ? error
-        : hasBattery ? "Headset " + status.battery + "% · spare " + status.charger_battery + "%"
+        : hasBattery ? "Headset " + status.battery + "%"
+            + (status.charger_battery !== null ? " · spare " + status.charger_battery + "%" : "")
         : connected ? "Wired headset"
         : "Headset not connected"
 
@@ -268,7 +269,8 @@ PlasmoidItem {
                             opacity: 0.7
                         }
                         BatteryReadout {
-                            percent: popup.st && popup.st.charger_battery !== null ? popup.st.charger_battery : 0
+                            visible: popup.st !== null && popup.st.charger_battery !== null
+                            percent: visible ? popup.st.charger_battery : 0
                             what: "spare"
                         }
                     }

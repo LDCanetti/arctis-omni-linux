@@ -289,10 +289,15 @@ def cmd_status(hub, args):
     if m.wireless:
         s = hub.query(CMD_STATUS)
         mode = {v: k for k, v in ANC_MODES.items()}.get(s[10], s[10])
+
+        def level(raw):
+            # A base station that's still starting up reports 0xFF: unknown, not 3187%.
+            return raw * 100 // m.battery_steps if raw <= m.battery_steps else None
+
         st = {
             "connected": s[14] == 0x08,
-            "battery": s[6] * 100 // m.battery_steps,
-            "charger_battery": s[7] * 100 // m.battery_steps,
+            "battery": level(s[6]),
+            "charger_battery": level(s[7]),
             "charging": s[15] == 0x02,
             "noise_mode": mode,
             "anc_level": s[16] if m.anc_level_supported else None,
@@ -323,9 +328,10 @@ def cmd_status(hub, args):
     print(f"model:        {m.name}")
     if m.wireless:
         print(f"headset:      {'connected' if st['connected'] else 'not connected'}")
-        if st["connected"]:
+        if st["connected"] and st["battery"] is not None:
             print(f"battery:      {st['battery']}%")
-        print(f"spare:        {st['charger_battery']}%")
+        spare = "unknown" if st["charger_battery"] is None else f"{st['charger_battery']}%"
+        print(f"spare:        {spare}")
         levels = f"ANC level {st['anc_level']}/3, " if st["anc_level"] is not None else ""
         note = "" if m.anc_writable else "; change it on the headset"
         print(f"noise mode:   {st['noise_mode']}  ({levels}transparency level {st['transparency_level']}/10{note})")
