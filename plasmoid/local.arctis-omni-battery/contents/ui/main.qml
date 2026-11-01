@@ -17,14 +17,16 @@ PlasmoidItem {
     readonly property bool connected: status !== null && status.connected
     // Wired models report no battery (battery is null).
     readonly property bool hasBattery: connected && status.battery !== null
-    readonly property string batteryText: hasBattery ? status.battery + "%" : connected ? "Wired" : "–"
+    readonly property bool wireless: status !== null && status.wireless
+    readonly property string batteryText: hasBattery ? status.battery + "%"
+        : connected ? (wireless ? "?" : "Wired") : "–"
 
     toolTipMainText: status ? status.model : "Arctis headset"
     toolTipSubText: status && status.firmware && status.firmware.update_available ? "Firmware update available"
         : error !== "" ? error
         : hasBattery ? "Headset " + status.battery + "%"
             + (status.charger_battery !== null ? " · spare " + status.charger_battery + "%" : "")
-        : connected ? "Wired headset"
+        : connected ? (wireless ? "Headset battery unknown" : "Wired headset")
         : "Headset not connected"
 
     P5Support.DataSource {
@@ -265,7 +267,7 @@ PlasmoidItem {
                         }
                         PlasmaComponents.Label {
                             visible: !root.hasBattery
-                            text: "Headset off"
+                            text: root.connected ? "Headset battery unknown" : "Headset off"
                             opacity: 0.7
                         }
                         BatteryReadout {
