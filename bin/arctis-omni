@@ -30,6 +30,7 @@ CMD_AUDIO_SETTINGS = 0x20
 CMD_ANC_LEVEL = 0xB8
 CMD_TRANSPARENT_LEVEL = 0xB9
 CMD_ANC_MODE = 0xBD
+CMD_MIC_VOLUME = 0x37
 CMD_SOFTWARE_CHATMIX = 0x49
 CMD_SONAR_PRESENT = 0x8D
 # GG waits this long after a hub appears before talking to it ("init-sleep-length").
@@ -353,6 +354,10 @@ def cmd_anc_level(hub, args):
 def cmd_transparency_level(hub, args):
     require_anc(hub)
     hub.send(CMD_TRANSPARENT_LEVEL, args.level)
+
+
+def cmd_mic_volume(hub, args):
+    hub.send(CMD_MIC_VOLUME, args.level)
 
 
 def cmd_sidetone(hub, args):
@@ -1157,6 +1162,9 @@ def main():
     s = sub.add_parser("transparency-level", help="transparency strength 1-10")
     s.add_argument("level", type=int, choices=range(1, 11))
     s.set_defaults(func=cmd_transparency_level)
+    s = sub.add_parser("mic-volume", help="microphone level 1-10")
+    s.add_argument("level", type=int, choices=range(1, 11))
+    s.set_defaults(func=cmd_mic_volume)
     s = sub.add_parser("sidetone", help="on, off, or a level (Omni 1-10, Nova Pro Wireless 1-3)")
     s.add_argument("value")
     s.set_defaults(func=cmd_sidetone)

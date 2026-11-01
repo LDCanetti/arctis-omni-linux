@@ -33,14 +33,17 @@ The Plasma widget sits in the panel. Wireless headsets show their battery; wired
 
 ![Panel widget showing the headset icon and "Wired"](docs/widget-panel-wired.png)
 
-Clicking it opens the full status. On a wireless headset (here a Nova Pro Wireless) that
-includes the battery, noise-mode buttons and a sidetone slider:
+Clicking it opens the controls (here on an Arctis Nova Pro Omni):
 
-![Widget popup for an Arctis Nova Pro Wireless: battery, spare battery, noise mode, sidetone slider, mic volume, ChatMix balance and Off / Transparency / ANC buttons](docs/widget-popup.png)
+![Widget popup for an Arctis Nova Pro Omni: headset and spare battery, Off / Transparency / ANC buttons with a strength slider, mic level and sidetone sliders, a ChatMix bar showing where the dial sits between Game and Chat, and the firmware status](docs/widget-popup.png)
 
-On the wired Nova Pro it shows only what that headset has:
+- **Noise mode**: Off / Transparency / ANC, with a strength slider for the active mode.
+- **Mic level** and **sidetone**: "Muted" appears when the headset mic is muted.
+- **ChatMix**: the marker follows the base station's dial between Game and Chat.
+- **Firmware**: an **Update…** button appears when SteelSeries has newer firmware.
 
-![Widget popup for a wired Arctis Nova Pro: "Wired headset", sidetone slider, mic volume and ChatMix balance](docs/widget-popup-wired.png)
+Rows a headset doesn't have are left out. A wired Nova Pro, for example, shows no batteries
+or noise mode.
 
 ## What you get
 
@@ -51,6 +54,7 @@ On the wired Nova Pro it shows only what that headset has:
   arctis-omni anc-level 1-3              # Omni only
   arctis-omni transparency-level 1-10    # wireless models
   arctis-omni sidetone on|off|<level>   # Omni 1-10, Nova Pro Wireless / wired 1-3
+  arctis-omni mic-volume 1-10
   arctis-omni output [headset|<sink>]   # where Arctis Game/Chat play (see below)
   arctis-omni firmware check|update     # firmware updates (see below)
   ```
@@ -58,7 +62,7 @@ On the wired Nova Pro it shows only what that headset has:
   and **Arctis Chat**. The service routes both to whichever supported headset is
   connected, and the dial sets their volumes.
 - **Plasma 6 widget** ("Arctis Headset Battery"): headset battery in the panel, and a popup
-  with full status, Off / Transparency / ANC buttons and a sidetone slider.
+  with the noise mode and its strength, mic level, sidetone, ChatMix and firmware status.
 - **udev rule** so your user can open the base station's `hidraw` node without root.
 
 ## Install
