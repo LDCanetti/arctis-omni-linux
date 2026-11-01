@@ -4,37 +4,56 @@ Linux controls for SteelSeries Arctis Nova Pro headsets: noise cancelling /
 transparency, mic sidetone, a working ChatMix dial, and a KDE Plasma panel widget with the
 battery level and status.
 
-| Model | USB ID | Status |
-|---|---|---|
-| Arctis Nova Pro Omni (GameHub) | `1038:2290` | Everything below |
-| Arctis Nova Pro Wireless (PC / Xbox / Xbox white base station) | `1038:12e0` / `12e5` / `225d` | Everything except ANC strength (it has none to set); tested on `12e5` |
-| Arctis Nova Pro, wired (GameDAC Gen 2, PC / Xbox) | `1038:12cb` / `12cd` | Sidetone, ChatMix and status; no battery or noise cancelling (wired, no ANC); tested on `12cb` |
+## Supported devices
+
+| | Arctis Nova Pro Omni | Arctis Nova Pro Wireless | Arctis Nova Pro (wired) |
+|---|---|---|---|
+| Connects through | GameHub | Base station (PC / Xbox / Xbox white) | GameDAC Gen 2 (PC / Xbox) |
+| USB ID | `1038:2290` | `1038:12e0` / `12e5` / `225d` | `1038:12cb` / `12cd` |
+| Headset and spare battery | ✅ | ✅ (12.5% steps) | — wired |
+| Charging state | ✅ | ✅ | — wired |
+| Noise mode: off / transparency / ANC | ✅ | ✅ | — no ANC |
+| Transparency level (1-10) | ✅ | ✅ | — no ANC |
+| ANC strength (1-3) | ✅ | — not adjustable | — no ANC |
+| Mic sidetone | ✅ off / 1-10 | ✅ off / 1-3 | ✅ off / 1-3 |
+| Mic volume and mute state | ✅ | ✅ | ✅ volume only |
+| ChatMix dial → Game/Chat outputs | ✅ | ✅ | ✅ |
+| Plasma widget | ✅ | ✅ | ✅ shows "Wired" |
+| Tested on | `2290` | `12e5` | `12cb` |
 
 SteelSeries GG is Windows-only. This talks to the base station / GameDAC directly over
 `hidraw`, with no kernel module or GG install.
 
 ## Screenshots
 
-The Plasma widget shows the headset battery in the panel:
+The Plasma widget sits in the panel. Wireless headsets show their battery; wired ones show
+"Wired":
 
 ![Panel widget showing the headset icon and 100% battery](docs/widget-panel.png)
 
-Clicking it opens the full status, with a sidetone slider and noise-mode buttons:
+![Panel widget showing the headset icon and "Wired"](docs/widget-panel-wired.png)
+
+Clicking it opens the full status. On a wireless headset (here a Nova Pro Wireless) that
+includes the battery, noise-mode buttons and a sidetone slider:
 
 ![Widget popup for an Arctis Nova Pro Wireless: battery, spare battery, noise mode, sidetone slider, mic volume, ChatMix balance and Off / Transparency / ANC buttons](docs/widget-popup.png)
+
+On the wired Nova Pro it shows only what that headset has:
+
+![Widget popup for a wired Arctis Nova Pro: "Wired headset", sidetone slider, mic volume and ChatMix balance](docs/widget-popup-wired.png)
 
 ## What you get
 
 - **`arctis-omni`**: a small Python CLI.
   ```
   arctis-omni status [--json]           # battery, spare battery, noise mode, sidetone, mic, dial
-  arctis-omni anc off|transparency|anc
+  arctis-omni anc off|transparency|anc  # wireless models
   arctis-omni anc-level 1-3              # Omni only
-  arctis-omni transparency-level 1-10
-  arctis-omni sidetone on|off|<level>   # Omni 1-10, Nova Pro Wireless 1-3
+  arctis-omni transparency-level 1-10    # wireless models
+  arctis-omni sidetone on|off|<level>   # Omni 1-10, Nova Pro Wireless / wired 1-3
   ```
 - **ChatMix**: a user service plus PipeWire config that adds two outputs, **Arctis Game**
-  and **Arctis Chat**. The service routes both to whichever supported base station is
+  and **Arctis Chat**. The service routes both to whichever supported headset is
   connected, and the dial sets their volumes.
 - **Plasma 6 widget** ("Arctis Headset Battery"): headset battery in the panel, and a popup
   with full status, Off / Transparency / ANC buttons and a sidetone slider.
