@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 import zlib
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 VENDOR = 0x1038
 EVENT = 0x07
 
