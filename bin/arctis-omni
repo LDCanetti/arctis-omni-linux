@@ -9,6 +9,7 @@ same interface.
 import argparse
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 
 VERSION = "0.3.0"
@@ -50,9 +52,11 @@ FIRMWARE_STATE = os.path.join(STATE_DIR, "firmware.json")
 FLASH_LOCK = os.path.join(STATE_DIR, "flashing")
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                          "arctis-omni")
-# SteelSeries ships firmware only inside GG; this link redirects to the latest installer,
-# whose file name carries the GG version.
-GG_LATEST_URL = "https://steelseries.com/gg/downloads/gg/latest/windows"
+# SteelSeries ships firmware only inside GG. This is GG's own updater endpoint. The public download link sits behind a Cloudflare browser
+# challenge; this API doesn't. It answers with the next release after current_version
+# (old versions step through intermediate releases) and an empty body when up to date.
+GG_CHECK_URL = "https://steelseries.com/api/v2/releases/gg/check-version"
+GG_BASELINE = "100.0.0"
 # Bumped when the set of cached firmware folders changes, so older caches get rebuilt.
 CACHE_FORMAT = "2"
 
@@ -606,21 +610,35 @@ def device_versions(hub):
 
 
 def gg_latest():
-    # (version, installer URL) of the latest GG, read from the download link's redirect.
-    request = urllib.request.Request(GG_LATEST_URL, method="HEAD", headers=USER_AGENT)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        url = response.geturl()
-    match = re.search(r"SteelSeriesGG([0-9.]+)Setup\.exe$", url)
-    if not match:
+    # (version, installer URL, installer MD5) of the latest GG release.
+    version, latest = GG_BASELINE, None
+    for _hop in range(10):
+        query = urllib.parse.urlencode({"current_version": version, "platform": "windows"})
+        request = urllib.request.Request(f"{GG_CHECK_URL}?{query}", headers=USER_AGENT)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read()
+        if not body.strip():
+            break
+        info = json.loads(body)
+        if version_key(info["version"]) <= version_key(version):
+            break
+        version, latest = info["version"], info
+    if latest is None:
+        raise RuntimeError("SteelSeries' update server didn't report a GG release")
+    url = latest["installer_url"]
+    if not re.fullmatch(r"https://[a-z0-9.-]+\.steelseriescdn\.com/SteelSeriesGG[0-9.]+Setup\.exe", url):
         raise RuntimeError(f"Unexpected GG download link: {url}")
-    return match.group(1), url
+    md5 = str(latest.get("checksum", "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", md5):
+        raise RuntimeError("SteelSeries' update server sent no installer checksum")
+    return version, url, md5
 
 
 def bundle_folder(cache, pid):
     return os.path.join(cache, "firmware", str((VENDOR << 16) | pid))
 
 
-def fetch_gg_firmware(version, url, log):
+def fetch_gg_firmware(version, url, md5, log):
     # Unpack only the firmware folders of supported devices from a GG release, once.
     cache = os.path.join(CACHE_DIR, f"gg-{version}")
     try:
@@ -639,9 +657,14 @@ def fetch_gg_firmware(version, url, log):
     with tempfile.TemporaryDirectory(dir=CACHE_DIR) as tmp:
         installer = os.path.join(tmp, "gg.exe")
         log(f"Downloading SteelSeries GG {version} to read the firmware in it (about 400 MB)…")
+        digest = hashlib.md5()
         with urllib.request.urlopen(urllib.request.Request(url, headers=USER_AGENT), timeout=60) as response, \
                 open(installer, "wb") as f:
-            shutil.copyfileobj(response, f, 1 << 20)
+            while chunk := response.read(1 << 20):
+                digest.update(chunk)
+                f.write(chunk)
+        if digest.hexdigest() != md5:
+            raise RuntimeError(f"GG {version} download is corrupt (checksum mismatch); try again")
         subprocess.run(["7z", "x", "-y", "-bso0", "-bsp0", f"-o{tmp}/x", installer,
                         "apps/engine/firmware/*"], check=True)
         staged = os.path.join(tmp, "staged")
@@ -730,10 +753,10 @@ def compare_device(state, hub):
 
 
 def firmware_check(log=print):
-    version, url = gg_latest()
+    version, url, md5 = gg_latest()
     state = load_firmware_state()
     state.update(gg_version=version, checked=time.strftime("%Y-%m-%d %H:%M"),
-                 cache=fetch_gg_firmware(version, url, log))
+                 cache=fetch_gg_firmware(version, url, md5, log))
     if find_hub():
         hub = Hub()
         try:

@@ -199,8 +199,9 @@ Nova Pro Wireless. The `BD` and `B9` writes were found to work on it by testing,
 ## Firmware updates
 
 SteelSeries publishes headset firmware only inside SteelSeries GG releases. A daily timer
-(`arctis-omni-firmware-check.timer`) asks SteelSeries' download link which GG version is
-current. When a new one appears, it downloads that installer once (about 400 MB), keeps only
+(`arctis-omni-firmware-check.timer`) asks SteelSeries' update server (the one GG itself
+uses) which GG version is current. When a new one appears, it downloads that installer once
+(about 400 MB), checks it against the server's checksum, keeps only
 the firmware for supported headsets in `~/.cache/arctis-omni` (about 20 MB), and compares it
 with what the connected headset reports. If anything is newer, you get a desktop
 notification, and the widget shows **Update available** with an **Update…** button.
