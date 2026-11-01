@@ -189,22 +189,46 @@ def usb_product(hidraw_node):
     return None
 
 
+# The open lock file while this process is updating firmware (an flock, so it's released
+# even if the updater dies).
+_flash_lock_fd = None
+
+
+def acquire_flash_lock():
+    global _flash_lock_fd
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd = os.open(FLASH_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    _flash_lock_fd = fd
+    return True
+
+
+def release_flash_lock():
+    global _flash_lock_fd
+    if _flash_lock_fd is not None:
+        os.close(_flash_lock_fd)
+        _flash_lock_fd = None
+
+
 def flash_lock_holder():
-    # PID of another process that is writing firmware, if any.
+    # True if another process is writing firmware.
+    if _flash_lock_fd is not None:
+        return False
     try:
-        with open(FLASH_LOCK) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
-        return None
-    if pid == os.getpid():
-        return None
+        fd = os.open(FLASH_LOCK, os.O_RDWR)
+    except OSError:
+        return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        pass
-    return pid
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
 
 
 class Hub:
@@ -609,10 +633,17 @@ def fetch_gg_firmware(version, url, log):
                 shutil.copytree(src, bundle_folder(staged, pid))
         os.makedirs(cache, exist_ok=True)
         os.replace(os.path.join(staged, "firmware"), os.path.join(cache, "firmware"))
-    for old in glob.glob(os.path.join(CACHE_DIR, "gg-*")):
-        if old != cache:
-            shutil.rmtree(old, ignore_errors=True)
+    prune_caches(keep=cache)
     return cache
+
+
+def prune_caches(keep):
+    # Remove older GG releases, unless an updater may still be reading one.
+    if flash_lock_holder():
+        return
+    for old in glob.glob(os.path.join(CACHE_DIR, "gg-*")):
+        if old != keep:
+            shutil.rmtree(old, ignore_errors=True)
 
 
 def bundle_versions(cache, model, pid):
@@ -693,7 +724,7 @@ def notify_update(state):
     device = state.get("device") or {}
     if not device.get("updates"):
         return
-    key = f"{state['gg_version']}:{device['pid']}:{sorted(device['updates'].items())}"
+    key = f"{device['pid']}:{sorted(device['updates'].items())}"
     if state.get("notified") == key:
         return
     chips = ", ".join(f"{chip} {device['current'][chip]} → {v}" for chip, v in device["updates"].items())
@@ -711,7 +742,8 @@ BERENA_BOOT_PIDS = {0x12CB: 0x12CC}
 BERENA_BLOCK = 512
 
 
-def hidraw_node(pid):
+def hidraw_nodes(pid):
+    nodes = []
     for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
         try:
             with open(f"{node}/device/uevent") as f:
@@ -719,10 +751,15 @@ def hidraw_node(pid):
                     continue
             with open(f"{node}/device/report_descriptor", "rb") as f:
                 if f.read(3) == b"\x06\xc0\xff":
-                    return "/dev/" + os.path.basename(node)
+                    nodes.append("/dev/" + os.path.basename(node))
         except OSError:
             continue
-    return None
+    return nodes
+
+
+def hidraw_node(pid):
+    nodes = hidraw_nodes(pid)
+    return nodes[0] if nodes else None
 
 
 class BerenaLink:
@@ -819,7 +856,7 @@ def firmware_file(folder, pattern, version):
 def pause(prompt="Press Enter to close…"):
     try:
         input(prompt)
-    except EOFError:
+    except (EOFError, KeyboardInterrupt, OSError):
         pass
 
 
@@ -832,26 +869,168 @@ def show_versions(device):
     print()
 
 
+def say(*args, **kwargs):
+    # print() that survives the terminal having been closed.
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
+
+class FlashInterrupted(RuntimeError):
+    pass
+
+
+class FlashSignals:
+    # While firmware is being written: Ctrl+C is ignored, closing the terminal lets the
+    # update run to the end without output, and SIGTERM aborts it the way GG does (the
+    # chip's reboot command), still releasing the lock and restarting ChatMix.
+    signals = (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+
+    def __enter__(self):
+        self.saved = {sig: signal.getsignal(sig) for sig in self.signals}
+        signal.signal(signal.SIGINT, lambda *_: say("\n  (Ctrl+C is ignored while firmware is being written)"))
+        signal.signal(signal.SIGHUP, self.on_hangup)
+        signal.signal(signal.SIGTERM, self.on_term)
+        return self
+
+    def __exit__(self, *_exc):
+        for sig, handler in self.saved.items():
+            signal.signal(sig, handler)
+
+    @staticmethod
+    def on_hangup(*_):
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+
+    @staticmethod
+    def on_term(*_):
+        raise FlashInterrupted("stopped by SIGTERM")
+
+
+def gamedac_nodes():
+    # Command nodes of every connected GameDAC we can flash, in app or bootloader mode.
+    pids = (*BERENA_BOOT_PIDS, *BERENA_BOOT_PIDS.values())
+    return [node for pid in pids for node in hidraw_nodes(pid)]
+
+
+def bootloader_app_pid():
+    # App PID of a GameDAC that's sitting in its bootloader (an interrupted update), if any.
+    return next((app for app, boot in BERENA_BOOT_PIDS.items() if hidraw_node(boot)), None)
+
+
+def run_flash(state, app_pid, chips, versions):
+    # Flash the given (name, chip id, file pattern) chips. True on success.
+    found = len(gamedac_nodes())
+    if found != 1:
+        say(f"Connect exactly one Arctis Nova Pro GameDAC while updating (found {found}).")
+        return False
+    # Read every image first, so a cache change can't pull a file away mid-update.
+    images = []
+    try:
+        for chip_name, chip, pattern in chips:
+            version = versions[chip_name]
+            with open(firmware_file(bundle_folder(state["cache"], app_pid), pattern, version), "rb") as f:
+                images.append((chip_name, chip, version, f.read()))
+    except (RuntimeError, OSError) as e:
+        say(f"Couldn't read the firmware files: {e}")
+        return False
+    if not acquire_flash_lock():
+        say("Another firmware update is already running.")
+        return False
+
+    def progress(chip_name, n, total):
+        say(f"\r  {chip_name}: {100 * n // total:3d}% ({n}/{total})", end="", flush=True)
+
+    service = "arctis-omni-chatmix.service"
+    was_active = False
+    failed = None
+    with FlashSignals():
+        try:
+            was_active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", service]).returncode == 0
+            if was_active:
+                subprocess.run(["systemctl", "--user", "stop", service], check=False)
+            time.sleep(2)
+            for chip_name, chip, version, data in images:
+                say(f"Writing {chip_name} firmware {version}…")
+                berena_flash_chip(app_pid, chip_name, chip, data, progress)
+                say(" done")
+                time.sleep(2)
+        except (RuntimeError, OSError) as e:
+            failed = e
+        finally:
+            release_flash_lock()
+            # Let the GameDAC finish rebooting before anything talks to it again.
+            deadline = time.time() + 20
+            while not hidraw_node(app_pid) and time.time() < deadline:
+                time.sleep(0.5)
+            time.sleep(3)
+            if was_active:
+                subprocess.run(["systemctl", "--user", "start", service], check=False)
+    if failed:
+        say(f"\n\nThe update FAILED: {failed}")
+        say("Leave the GameDAC connected and run the update again. If it was left in its "
+            "bootloader, the updater will offer to recover it.")
+        return False
+    return True
+
+
+def refresh_device(state):
+    if find_hub():
+        hub = Hub()
+        try:
+            compare_device(state, hub)
+        finally:
+            hub.close()
+        save_firmware_state(state)
+
+
+def ask(prompt, answer):
+    try:
+        return input(prompt).strip() == answer
+    except (EOFError, KeyboardInterrupt, OSError):
+        say()
+        return False
+
+
 def cmd_firmware_update(_args):
     print(f"Arctis firmware update (arctis-omni {VERSION})\n")
     try:
         state = firmware_check()
     except Exception as e:
         print(f"Couldn't check for firmware: {e}")
+        # Recovering an interrupted update can still use an earlier check's files.
+        state = load_firmware_state()
+        if not (state.get("cache") and bootloader_app_pid()):
+            return pause()
+
+    recovering = bootloader_app_pid()
+    if recovering:
+        model = next(m for m in MODELS if recovering in m.pids)
+        usb = bundle_versions(state["cache"], model, recovering).get("USB", (None,))[0]
+        print(f"An {model.name} GameDAC is in its bootloader: a firmware update was interrupted.")
+        if not usb:
+            print("No USB firmware for it in the cached SteelSeries GG release; check your connection and retry.")
+            return pause()
+        print(f"Re-installing its USB firmware ({usb}) brings it back.\n")
+        if not ask("Type 'recover' to start: ", "recover"):
+            return print("Cancelled; nothing was changed.")
+        if not run_flash(state, recovering, [BERENA_CHIPS[0]], {"USB": usb}):
+            return pause()
+        print("\nRecovered.")
+        refresh_device(state)
+        if state.get("device"):
+            show_versions(state["device"])
+            if state["device"]["updates"]:
+                print("Run the update again to install the rest.")
         return pause()
+
     while not state.get("device") or not find_hub():
         print("Connect your headset's base station or GameDAC to this PC with its USB cable.")
         try:
             input("Press Enter when it's connected (Ctrl+C to quit)… ")
         except (EOFError, KeyboardInterrupt):
             return print()
-        if find_hub():
-            hub = Hub()
-            try:
-                compare_device(state, hub)
-            finally:
-                hub.close()
-            save_firmware_state(state)
+        refresh_device(state)
     device = state["device"]
     print(f"{device['model']}, firmware from SteelSeries GG {state['gg_version']}:")
     show_versions(device)
@@ -863,69 +1042,21 @@ def cmd_firmware_update(_args):
     chips = [c for c in BERENA_CHIPS if c[0] in device["updates"]]
     if not chips:
         print("Everything is up to date.")
-        try:
-            if input("Re-install the current firmware anyway? Type 'reinstall' to do so: ").strip() != "reinstall":
-                return
-        except (EOFError, KeyboardInterrupt):
-            return print()
+        if not ask("Re-install the current firmware anyway? Type 'reinstall' to do so: ", "reinstall"):
+            return
         chips = list(BERENA_CHIPS)
     print("Before starting:")
     print("  • Connect the GameDAC to this PC directly with its USB cable (not through a USB hub),")
     print("    with the headset plugged into the GameDAC.")
     print("  • Don't unplug anything until it says it's finished (about a minute).")
     print("  • Updating the MCU resets the GameDAC's settings (sidetone, EQ…) to their defaults.\n")
-    try:
-        if input("Type 'update' to start: ").strip() != "update":
-            return print("Cancelled; nothing was changed.")
-    except (EOFError, KeyboardInterrupt):
-        return print("\nCancelled; nothing was changed.")
-    app_pid = int(device["pid"], 16)
-    service = "arctis-omni-chatmix.service"
-    was_active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", service]).returncode == 0
-    if was_active:
-        subprocess.run(["systemctl", "--user", "stop", service], check=False)
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(FLASH_LOCK, "w") as f:
-        f.write(str(os.getpid()))
-    time.sleep(2)
-
-    def progress(chip_name, n, total):
-        print(f"\r  {chip_name}: {100 * n // total:3d}% ({n}/{total})", end="", flush=True)
-
-    failed = None
-    try:
-        for chip_name, chip, pattern in chips:
-            version = device["available"][chip_name]
-            path = firmware_file(bundle_folder(state["cache"], app_pid), pattern, version)
-            print(f"Writing {chip_name} firmware {version}…")
-            with open(path, "rb") as f:
-                berena_flash_chip(app_pid, chip_name, chip, f.read(), progress)
-            print(" done")
-            time.sleep(2)
-    except (RuntimeError, OSError) as e:
-        failed = e
-    finally:
-        os.remove(FLASH_LOCK)
-        # Let the GameDAC finish rebooting before anything talks to it again.
-        deadline = time.time() + 20
-        while not hidraw_node(app_pid) and time.time() < deadline:
-            time.sleep(0.5)
-        time.sleep(3)
-        if was_active:
-            subprocess.run(["systemctl", "--user", "start", service], check=False)
-    if failed:
-        print(f"\n\nThe update FAILED: {failed}")
-        print("Leave the GameDAC connected and run the update again; if it shows up as "
-              "'SteelSeries Bootloader', the update can be retried from there.")
+    if not ask("Type 'update' to start: ", "update"):
+        return print("Cancelled; nothing was changed.")
+    if not run_flash(state, int(device["pid"], 16), chips, device["available"]):
         return pause()
-    if find_hub():
-        hub = Hub()
-        try:
-            compare_device(state, hub)
-        finally:
-            hub.close()
-        save_firmware_state(state)
-        print("\nFinished. Firmware now:")
+    refresh_device(state)
+    say("\nFinished. Firmware now:")
+    if state.get("device"):
         show_versions(state["device"])
     pause()
 

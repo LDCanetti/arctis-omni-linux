@@ -214,8 +214,16 @@ arctis-omni firmware update   # the interactive updater (the widget's button ope
 | Arctis Nova Pro Wireless | Check only; update with GG on Windows. |
 
 For models that are check-only, the Update button explains how to update with GG instead of
-flashing. While the updater writes firmware it pauses the ChatMix service and holds a lock,
-so the widget and other commands leave the device alone.
+flashing. While the updater writes firmware, it:
+- pauses the ChatMix service and holds a lock, so the widget and other commands leave the
+  device alone;
+- ignores Ctrl+C, and keeps going if its terminal is closed. SIGTERM aborts cleanly;
+- refuses to start with more than one GameDAC connected.
+
+If a GameDAC update is interrupted anyway, the GameDAC may not show up until it's replugged.
+It then comes back as **SteelSeries Bootloader** (`1038:12cc`), and running
+`arctis-omni firmware update` again offers to recover it. Recovery was tested by killing an
+update halfway through the USB chip.
 
 On Omni firmware 1.32.0, the knob only enters ChatMix mode if software ChatMix is enabled
 *before* Sonar present, after both have been cleared. The service does this, and waits 5 s
