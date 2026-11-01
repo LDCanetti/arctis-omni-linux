@@ -72,7 +72,7 @@ Each [release](https://github.com/LDCanetti/arctis-omni-linux/releases/latest) h
 package. Install it with pacman, using the `.pkg.tar.zst` link from the release:
 
 ```sh
-sudo pacman -U https://github.com/LDCanetti/arctis-omni-linux/releases/download/v0.2.1/arctis-omni-linux-0.2.1-1-any.pkg.tar.zst
+sudo pacman -U https://github.com/LDCanetti/arctis-omni-linux/releases/download/v0.2.2/arctis-omni-linux-0.2.2-1-any.pkg.tar.zst
 ```
 
 Or build it yourself from the PKGBUILD:
