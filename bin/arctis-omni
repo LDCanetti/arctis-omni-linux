@@ -310,6 +310,12 @@ def route_outputs(product):
     return True
 
 
+def valid_mix(game, chat):
+    # A real dial position always has one side at 100 (100/100 is the centre). A hub that
+    # has just connected reports 0/0 until it has finished starting up.
+    return max(game, chat) == 100
+
+
 def cmd_chatmix_daemon(_hub, _args):
     # Puts the hub in software-ChatMix mode and tells it a mixer ("Sonar") is present, as
     # GG does while Sonar runs, then mirrors the dial onto the Game/Chat loopback sinks.
@@ -331,22 +337,27 @@ def cmd_chatmix_daemon(_hub, _args):
             hub = Hub()
             hub.send(CMD_SONAR_PRESENT, 1)
             hub.send(CMD_SOFTWARE_CHATMIX, 1)
-            a = hub.settings()
-            mix = (a["chatmix_game"], a["chatmix_chat"])
-            print(f"chatmix active on {hub.path} ({hub.model.name}): "
-                  f"game {mix[0]}% chat {mix[1]}%", flush=True)
-            # Routing and volumes are retried every second until they succeed (sinks not
-            # up yet, PipeWire restarting).
+            print(f"chatmix active on {hub.path} ({hub.model.name})", flush=True)
+            # The dial position, routing and volumes are retried every second until they
+            # succeed (hub still starting up, sinks not up yet, PipeWire restarting). Until
+            # the dial position is known the volumes are left alone rather than zeroed.
+            mix = None
             routed = applied = False
             while not stop:
+                if mix is None:
+                    a = hub.settings()
+                    if valid_mix(a["chatmix_game"], a["chatmix_chat"]):
+                        mix = (a["chatmix_game"], a["chatmix_chat"])
+                        applied = False
+                        print(f"dial at game {mix[0]}% chat {mix[1]}%", flush=True)
                 if not routed:
                     routed = route_outputs(hub.product)
                     if routed:
                         print(f"game/chat outputs routed to {hub.product}", flush=True)
-                if not applied:
+                if mix is not None and not applied:
                     applied = set_volume(GAME_SINK, mix[0]) & set_volume(CHAT_SINK, mix[1])
                 d = hub.read(1.0)
-                if d and d[0] == EVENT and d[1] == EV_CHATMIX:
+                if d and d[0] == EVENT and d[1] == EV_CHATMIX and valid_mix(d[2], d[3]):
                     mix = (d[2], d[3])
                     applied = False
         except OSError as e:
