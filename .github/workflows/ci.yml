@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m py_compile bin/arctis-omni
+      - name: CLI runs
+        run: python3 bin/arctis-omni --version
+      - name: Shell scripts
+        run: shellcheck -S warning -s bash install.sh uninstall.sh packaging/arch/arctis-omni-linux.install
+      - name: Widget metadata
+        run: python3 -m json.tool plasmoid/local.arctis-omni-battery/metadata.json > /dev/null
+      - name: Versions agree
+        run: |
+          cli=$(python3 bin/arctis-omni --version | awk '{print $2}')
+          pkg=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          echo "CLI $cli, PKGBUILD $pkg"
+          test "$cli" = "$pkg"
+
+  package:
+    # Build the Arch package from this commit (the tag tarball doesn't exist yet).
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm git namcap
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          build=/home/builder/build
+          mkdir -p "$build"
+          cp packaging/arch/PKGBUILD packaging/arch/arctis-omni-linux.install "$build"
+          # makepkg uses a source file that's already present instead of downloading it.
+          git archive --prefix="arctis-omni-linux-$pkgver/" -o "$build/arctis-omni-linux-$pkgver.tar.gz" HEAD
+          chown -R builder "$build"
+          su builder -c "cd $build && makepkg --nodeps --noconfirm"
+          namcap "$build"/PKGBUILD "$build"/*.pkg.tar.zst
+          tar -tf "$build"/*.pkg.tar.zst | grep -v '/$'

@@ -1,0 +1,37 @@
+# Maintainer: LDCanetti <50004997+LDCanetti@users.noreply.github.com>
+pkgname=arctis-omni-linux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Controls for SteelSeries Arctis Nova Pro headsets: ANC, sidetone, ChatMix dial and a Plasma battery widget"
+arch=('any')
+url="https://github.com/LDCanetti/arctis-omni-linux"
+license=('MIT')
+depends=('python' 'pipewire' 'pipewire-pulse' 'libpulse' 'wireplumber')
+optdepends=('plasma-workspace: panel widget')
+install=arctis-omni-linux.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# The release workflow replaces this with the real checksum (updpkgsums) before publishing.
+sha256sums=('SKIP')
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    install -Dm755 bin/arctis-omni "$pkgdir/usr/bin/arctis-omni"
+    install -Dm644 pipewire/60-arctis-omni-chatmix.conf \
+        "$pkgdir/usr/share/pipewire/pipewire.conf.d/60-arctis-omni-chatmix.conf"
+    install -Dm644 udev/70-arctis-nova-pro-omni.rules \
+        "$pkgdir/usr/lib/udev/rules.d/70-arctis-nova-pro-omni.rules"
+
+    # The per-user files point at ~/.local/bin; the package installs to /usr/bin.
+    install -d "$pkgdir/usr/lib/systemd/user"
+    sed 's|%h/.local/bin/arctis-omni|/usr/bin/arctis-omni|' systemd/arctis-omni-chatmix.service \
+        > "$pkgdir/usr/lib/systemd/user/arctis-omni-chatmix.service"
+
+    local plasmoid="$pkgdir/usr/share/plasma/plasmoids/local.arctis-omni-battery"
+    install -d "$plasmoid"
+    cp -r plasmoid/local.arctis-omni-battery/. "$plasmoid"
+    sed -i 's|@ARCTIS_OMNI@|/usr/bin/arctis-omni|' "$plasmoid/contents/ui/main.qml"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

@@ -1,0 +1,96 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching pkgver in packaging/arch/PKGBUILD and VERSION in
+# bin/arctis-omni) to build the Arch package and publish a GitHub release. If the
+# AUR_SSH_PRIVATE_KEY secret is set, the PKGBUILD is also pushed to the AUR.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm git namcap pacman-contrib
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the code
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          cli=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' bin/arctis-omni)
+          pkg=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          echo "tag $tag, CLI $cli, PKGBUILD $pkg"
+          test "$tag" = "$cli" && test "$tag" = "$pkg"
+      - name: Build from the tag tarball
+        run: |
+          useradd -m builder
+          build=/home/builder/build
+          mkdir -p "$build"
+          cp packaging/arch/PKGBUILD packaging/arch/arctis-omni-linux.install "$build"
+          chown -R builder "$build"
+          su builder -c "cd $build && updpkgsums && makepkg --nodeps --noconfirm && makepkg --printsrcinfo > .SRCINFO"
+          namcap "$build"/PKGBUILD "$build"/*.pkg.tar.zst
+          mkdir dist
+          cp "$build"/*.pkg.tar.zst "$build"/PKGBUILD "$build"/arctis-omni-linux.install "$build"/.SRCINFO dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: dist/
+          include-hidden-files: true
+
+  release:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: dist
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.pkg.tar.zst
+            dist/PKGBUILD
+            dist/arctis-omni-linux.install
+
+  aur:
+    needs: package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - name: Skip without an AUR key
+        if: env.AUR_SSH_PRIVATE_KEY == ''
+        run: echo "AUR_SSH_PRIVATE_KEY isn't set; not publishing to the AUR."
+      - name: Install tools
+        if: env.AUR_SSH_PRIVATE_KEY != ''
+        run: pacman -Syu --noconfirm git openssh
+      - uses: actions/download-artifact@v4
+        if: env.AUR_SSH_PRIVATE_KEY != ''
+        with:
+          name: package
+          path: dist
+      - name: Push to the AUR
+        if: env.AUR_SSH_PRIVATE_KEY != ''
+        run: |
+          install -d -m700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          git clone ssh://aur@aur.archlinux.org/arctis-omni-linux.git aur
+          cp dist/PKGBUILD dist/arctis-omni-linux.install dist/.SRCINFO aur/
+          cd aur
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add PKGBUILD arctis-omni-linux.install .SRCINFO
+          git commit -m "Update to ${GITHUB_REF_NAME#v}" || { echo "No changes"; exit 0; }
+          git push origin HEAD:master
