@@ -1,6 +1,6 @@
 # arctis-omni-linux
 
-Linux controls for SteelSeries Arctis base-station headsets: noise cancelling /
+Linux controls for SteelSeries Arctis Nova Pro headsets: noise cancelling /
 transparency, mic sidetone, a working ChatMix dial, and a KDE Plasma panel widget with the
 battery level and status.
 
@@ -8,9 +8,10 @@ battery level and status.
 |---|---|---|
 | Arctis Nova Pro Omni (GameHub) | `1038:2290` | Everything below |
 | Arctis Nova Pro Wireless (PC / Xbox / Xbox white base station) | `1038:12e0` / `12e5` / `225d` | Everything except ANC strength (it has none to set); tested on `12e5` |
+| Arctis Nova Pro, wired (GameDAC Gen 2, PC / Xbox) | `1038:12cb` / `12cd` | Sidetone, ChatMix and status; no battery or noise cancelling (wired, no ANC); tested on `12cb` |
 
-SteelSeries GG is Windows-only. This talks to the base station directly over `hidraw`,
-with no kernel module or GG install.
+SteelSeries GG is Windows-only. This talks to the base station / GameDAC directly over
+`hidraw`, with no kernel module or GG install.
 
 ## Screenshots
 
@@ -63,20 +64,23 @@ Then:
 These base stations don't mix game and chat audio themselves for a single PC. Their
 hardware mix only blends their two USB inputs (PC on USB-1 vs. an Xbox). On Windows, GG
 switches the hub into **software ChatMix** mode, and the Sonar app does the mixing on the
-PC. This project does the same: `arctis-omni chatmix-daemon` enables software mode, points
+PC. This project does the same: `arctis-omni chatmix-daemon` tells the hub that Sonar is
+present and enables software mode, points
 the Game/Chat outputs at the connected headset (via PipeWire's `target.object` routing
 metadata), listens for dial events, and sets the two outputs' volumes with `pactl`. When the
-service stops, it switches the hub back to hardware mode.
+service stops, it clears both, as GG does when it shuts down. The wired Nova Pro's GameDAC
+only lets its knob switch to ChatMix while "Sonar present" is set (it shows a Sonar icon).
 
 The loopback sinks use `node.dont-fallback` + `node.linger`. If the headset disappears, they
 wait for it instead of moving your game audio to the speakers.
 
 ## Protocol
 
-Both models use 64-byte HID output reports on the **usage page `0xFFC0`** collection, with
-**report ID `0x01`** (Omni) or **`0x06`** (Nova Pro Wireless), shown as `rid` below. Both
-hubs send events as **report ID `0x07`** on the same interface, interleaved with command
-replies, so filter on both bytes.
+All models use 64-byte HID output reports on the **usage page `0xFFC0`** collection, with
+**report ID `0x01`** (Omni) or **`0x06`** (Nova Pro Wireless and wired), shown as `rid`
+below. They send events as **report ID `0x07`** on the same interface, interleaved with
+command replies, so filter on both bytes. The wired Nova Pro has no `B0` status (no battery,
+link or noise mode); its settings block and sidetone match the Nova Pro Wireless.
 
 | Function | Command | Notes |
 |---|---|---|
@@ -86,8 +90,9 @@ replies, so filter on both bytes.
 | Transparency level | `rid B9 <1-10>` | |
 | Mic sidetone | Omni `01 38 <on 0/1> <level 1-10>`; Nova Pro Wireless `06 39 <0-3>` | Nova Pro Wireless: 0 off, 1 low, 2 medium, 3 high |
 | Software ChatMix | `rid 49 <0/1>` | `1`: hub reports the dial instead of mixing |
+| Sonar present | `rid 8D <0/1>` | Tells the hub a PC mixer is running; required for ChatMix on the wired GameDAC |
 | Settings block | Omni: `01 20`, then a `HIDIOCGFEATURE` read of report 1 (1037 bytes) | Starts at the command byte. From offset 141: `+4` mic volume, `+5` sidetone level, `+10`/`+11` ChatMix game/chat, `+28` sidetone on/off |
-| | Nova Pro Wireless: `06 20` → `06 20 …` (normal reply) | `[17]` mic volume, `[18]` sidetone, `[20]`/`[21]` ChatMix game/chat |
+| | Nova Pro Wireless and wired: `06 20` → `06 20 …` (normal reply) | `[17]` mic volume, `[18]` sidetone, `[20]`/`[21]` ChatMix game/chat |
 
 | Event | Meaning |
 |---|---|
@@ -102,7 +107,10 @@ Nova Pro Wireless. The `BD` and `B9` writes were found to work on it by testing,
 - Omni (base firmware 1.28.0): status/battery fields, noise mode switching, sidetone set and
   read back, ChatMix enable plus dial events.
 - Nova Pro Wireless (`12e5`): status/battery fields, noise mode (off / transparency / ANC,
-  confirmed audibly), transparency level, sidetone set and read back, ChatMix routing.
+  confirmed audibly), transparency level, sidetone set and read back, ChatMix routing and
+  dial events.
+- Nova Pro wired (`12cb`, GameDAC firmware DSP 2.04.00 / MCU 1.10.08 / USB 0.28.00):
+  sidetone set and read back, Sonar present, ChatMix routing and dial events.
 
 **Not yet verified:** the Omni's ANC/transparency *level* writes, and the charging value of
 `[15]` while actually charging.

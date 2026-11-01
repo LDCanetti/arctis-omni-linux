@@ -15,16 +15,19 @@ PlasmoidItem {
     property string error: ""
 
     readonly property bool connected: status !== null && status.connected
-    readonly property string batteryText: connected ? status.battery + "%" : "–"
+    // Wired models report no battery (battery is null).
+    readonly property bool hasBattery: connected && status.battery !== null
+    readonly property string batteryText: hasBattery ? status.battery + "%" : connected ? "Wired" : "–"
     readonly property string batteryIcon: {
-        if (!connected) return "audio-headset";
+        if (!hasBattery) return "audio-headset";
         const level = Math.min(100, Math.round(status.battery / 10) * 10);
         return "battery-" + String(level).padStart(3, "0") + (status.charging ? "-charging" : "");
     }
 
     toolTipMainText: status ? status.model : "Arctis headset"
     toolTipSubText: error !== "" ? error
-        : connected ? "Headset " + status.battery + "% · spare " + status.charger_battery + "%"
+        : hasBattery ? "Headset " + status.battery + "% · spare " + status.charger_battery + "%"
+        : connected ? "Wired headset"
         : "Headset not connected"
 
     P5Support.DataSource {
@@ -81,7 +84,7 @@ PlasmoidItem {
             }
             PlasmaComponents.Label {
                 text: root.batteryText
-                color: root.connected && root.status.battery <= 15 ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+                color: root.hasBattery && root.status.battery <= 15 ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
             }
         }
     }
@@ -111,8 +114,8 @@ PlasmoidItem {
                 }
                 PlasmaComponents.Label {
                     visible: root.status !== null
-                    text: root.connected ? "Headset " + root.status.battery + "%" + (root.status.charging ? " (charging)" : "")
-                        : "Headset not connected"
+                    text: root.hasBattery ? "Headset " + root.status.battery + "%" + (root.status.charging ? " (charging)" : "")
+                        : root.connected ? "Wired headset" : "Headset not connected"
                     Layout.fillWidth: true
                 }
             }
@@ -123,10 +126,12 @@ PlasmoidItem {
             visible: root.status !== null
             Layout.fillWidth: true
             PlasmaComponents.Label {
+                visible: root.status !== null && root.status.wireless
                 Kirigami.FormData.label: "Spare battery:"
                 text: root.status ? root.status.charger_battery + "%" : ""
             }
             PlasmaComponents.Label {
+                visible: root.status !== null && root.status.wireless
                 Kirigami.FormData.label: "Noise mode:"
                 // anc_level is null on models that only report the noise mode.
                 text: !root.status ? "" : root.status.noise_mode === "anc"
@@ -176,7 +181,7 @@ PlasmoidItem {
             }
             PlasmaComponents.Label {
                 Kirigami.FormData.label: "Mic:"
-                text: !root.status ? "" : "Volume " + root.status.mic_volume + "/10" + (root.status.mic_muted ? ", muted" : "")
+                text: !root.status ? "" : "Volume " + root.status.mic_volume + "/10" + (root.status.mic_muted === true ? ", muted" : "")
             }
             PlasmaComponents.Label {
                 Kirigami.FormData.label: "ChatMix:"
@@ -199,7 +204,7 @@ PlasmoidItem {
         }
 
         PlasmaComponents.Label {
-            visible: root.connected && !root.status.anc_writable
+            visible: root.connected && root.status.wireless && !root.status.anc_writable
             text: "Change the noise mode on the headset"
             opacity: 0.7
             Layout.alignment: Qt.AlignHCenter
