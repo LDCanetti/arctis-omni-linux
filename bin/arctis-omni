@@ -624,7 +624,8 @@ def fetch_gg_firmware(version, url, log):
                 return cache
     except OSError:
         pass
-    shutil.rmtree(os.path.join(cache, "firmware"), ignore_errors=True)
+    # An outdated cache stays usable (e.g. for recovering a GameDAC offline) until its
+    # replacement is fully unpacked.
     if not shutil.which("7z"):
         raise RuntimeError("7z is needed to unpack SteelSeries GG; install 7zip")
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -644,7 +645,10 @@ def fetch_gg_firmware(version, url, log):
             if os.path.isdir(src):
                 shutil.copytree(src, bundle_folder(staged, pid))
         os.makedirs(cache, exist_ok=True)
-        os.replace(os.path.join(staged, "firmware"), os.path.join(cache, "firmware"))
+        current = os.path.join(cache, "firmware")
+        if os.path.isdir(current):
+            os.replace(current, os.path.join(tmp, "previous"))  # removed with tmp
+        os.replace(os.path.join(staged, "firmware"), current)
         with open(os.path.join(cache, "format"), "w") as f:
             f.write(CACHE_FORMAT + "\n")
     prune_caches(keep=cache)
