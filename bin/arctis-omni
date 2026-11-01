@@ -28,6 +28,8 @@ CMD_TRANSPARENT_LEVEL = 0xB9
 CMD_ANC_MODE = 0xBD
 CMD_SOFTWARE_CHATMIX = 0x49
 CMD_SONAR_PRESENT = 0x8D
+# GG waits this long after a hub appears before talking to it ("init-sleep-length").
+HUB_INIT_SECONDS = 5
 EV_CHATMIX = 0x45
 
 ANC_MODES = {"off": 0, "transparency": 1, "anc": 2}
@@ -401,8 +403,18 @@ def cmd_chatmix_daemon(_hub, _args):
         hub = None
         try:
             hub = Hub()
-            hub.send(CMD_SONAR_PRESENT, 1)
-            hub.send(CMD_SOFTWARE_CHATMIX, 1)
+            for _ in range(HUB_INIT_SECONDS * 10):
+                if stop:
+                    break
+                time.sleep(0.1)
+            # Omni firmware 1.32 only lets its knob enter ChatMix mode after the flags are
+            # cleared and then set software ChatMix first, Sonar present second; sent in
+            # the other order the Sonar icon shows but the knob stays on volume. (Verified on
+            # the Omni at 1.32; the Nova Pro models were verified with the old order.)
+            for cmd, value in ((CMD_SOFTWARE_CHATMIX, 0), (CMD_SONAR_PRESENT, 0),
+                               (CMD_SOFTWARE_CHATMIX, 1), (CMD_SONAR_PRESENT, 1)):
+                hub.send(cmd, value)
+                time.sleep(0.3)
             print(f"chatmix active on {hub.path} ({hub.model.name})", flush=True)
             # The dial position, routing and volumes are retried every second until they
             # succeed (hub still starting up, sinks not up yet, PipeWire restarting). Until
