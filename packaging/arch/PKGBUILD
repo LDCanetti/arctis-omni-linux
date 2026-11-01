@@ -1,6 +1,6 @@
 # Maintainer: LDCanetti <50004997+LDCanetti@users.noreply.github.com>
 pkgname=arctis-omni-linux
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc="Controls for SteelSeries Arctis Nova Pro headsets: ANC, sidetone, ChatMix dial and a Plasma battery widget"
 arch=('any')
