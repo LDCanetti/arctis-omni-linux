@@ -64,8 +64,17 @@ else
 fi
 
 echo "Installed."
-echo "  - Set your default output to \"Arctis Omni Game\" and your voice app's output to \"Arctis Omni Chat\"."
+# The service and widget use absolute paths; only interactive use of the CLI needs PATH.
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+        echo "  - $BIN_DIR is not on your PATH, so 'arctis-omni' won't be found in a shell."
+        echo "    For bash/zsh, add this to ~/.bashrc or ~/.zshrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "    (or run it as $BIN_DIR/arctis-omni)"
+        ;;
+esac
+echo "  - Set your default output to \"Arctis Game\" and your voice app's output to \"Arctis Chat\"."
 if [ "$plasmoid_changed" = 1 ]; then
-    echo "  - Widget updated: add \"Arctis Omni Battery\" to a panel, or run"
+    echo "  - Widget updated: add \"Arctis Headset Battery\" to a panel, or run"
     echo "    'systemctl --user restart plasma-plasmashell' to reload an existing one."
 fi
