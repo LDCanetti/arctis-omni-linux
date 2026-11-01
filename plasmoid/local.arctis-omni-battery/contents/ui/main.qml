@@ -57,8 +57,10 @@ PlasmoidItem {
     function refresh() { runner.connectSource(tool + " status --json"); }
     function run(args) { runner.connectSource(tool + " " + args); }
 
+    // Every 10 s in the panel, every 2 s while the popup is open, so a headset that
+    // connects, disconnects or changes settings shows up promptly.
     Timer {
-        interval: 60000
+        interval: root.expanded ? 2000 : 10000
         running: true
         repeat: true
         triggeredOnStart: true
@@ -169,7 +171,8 @@ PlasmoidItem {
                     Connections {
                         target: root
                         function onStatusChanged() {
-                            if (!sidetoneSlider.pressed && root.status)
+                            // Don't overwrite a drag, or a scroll that hasn't been sent yet.
+                            if (!sidetoneSlider.pressed && !wheelSettle.running && root.status)
                                 sidetoneSlider.value = root.status.sidetone_on ? root.status.sidetone_level : 0;
                         }
                     }
