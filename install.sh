@@ -6,6 +6,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 SUDO=${SUDO:-sudo}
+
+# The pacman package installs the same pieces system-wide; both together would load the
+# Game/Chat outputs twice.
+if [ -e /usr/bin/arctis-omni ]; then
+    echo "arctis-omni is already installed system-wide (pacman package); not installing per user." >&2
+    exit 1
+fi
 BIN_DIR="$HOME/.local/bin"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 PIPEWIRE_DIR="$HOME/.config/pipewire/pipewire.conf.d"

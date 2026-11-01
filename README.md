@@ -62,26 +62,59 @@ On the wired Nova Pro it shows only what that headset has:
 
 ## Install
 
-Requirements: Python 3, PipeWire with `pipewire-pulse` (`pactl`), systemd user services,
-and Plasma 6 for the widget.
+Requirements: Python 3, PipeWire with `pipewire-pulse` (`pactl`) and WirePlumber, systemd
+user services, and Plasma 6 for the widget.
+
+### Arch Linux and derivatives (CachyOS, EndeavourOS, Manjaro…)
+
+Each [release](https://github.com/LDCanetti/arctis-omni-linux/releases/latest) has a ready-made
+package. Install it with pacman, using the `.pkg.tar.zst` link from the release:
 
 ```sh
+sudo pacman -U https://github.com/LDCanetti/arctis-omni-linux/releases/download/v0.1.0/arctis-omni-linux-0.1.0-1-any.pkg.tar.zst
+```
+
+Or build it yourself from the PKGBUILD:
+
+```sh
+git clone https://github.com/LDCanetti/arctis-omni-linux
+cd arctis-omni-linux/packaging/arch
+makepkg -si
+```
+
+Then, as your normal user:
+
+```sh
+systemctl --user enable --now arctis-omni-chatmix.service
+systemctl --user restart pipewire   # loads the Arctis Game / Arctis Chat outputs
+```
+
+Replug the base station so the udev rule applies. Restarting PipeWire drops running apps'
+audio streams; Discord needs you to rejoin voice.
+
+### Any distribution (per-user install)
+
+```sh
+git clone https://github.com/LDCanetti/arctis-omni-linux
+cd arctis-omni-linux
 ./install.sh                 # uses sudo for the udev rule
 SUDO=pkexec ./install.sh     # or a graphical password prompt
 ```
 
-Then:
+This installs to your home directory, plus the udev rule. It refuses if the pacman package
+is installed, since both together would load the Game/Chat outputs twice. `./uninstall.sh`
+removes it and puts the hub back into hardware ChatMix mode.
+
+The CLI goes to `~/.local/bin`. If your shell doesn't already have that on `PATH` (stock
+Arch bash doesn't), `install.sh` says so; add `export PATH="$HOME/.local/bin:$PATH"` to
+`~/.bashrc` or `~/.zshrc`. The service and widget don't need it.
+
+### After installing
 
 1. Set your default output to **Arctis Game** and your voice app's output (Discord etc.)
    to **Arctis Chat**. Apps that play to the headset's own output aren't
    affected by the dial.
 2. Add **Arctis Headset Battery** to a panel (right-click the panel → Add Widgets).
-
-The CLI is installed to `~/.local/bin`. If your shell doesn't already have that on `PATH`
-(stock Arch bash doesn't), `install.sh` says so; add `export PATH="$HOME/.local/bin:$PATH"`
-to `~/.bashrc` or `~/.zshrc`. The service and widget don't need it.
-
-`./uninstall.sh` removes everything and puts the hub back into hardware ChatMix mode.
 
 ## How ChatMix works
 
@@ -165,6 +198,17 @@ Wireless. Omni support is in progress in [PR #584](https://github.com/Sapd/Heads
 reads 0% battery on Linux because of the interleaved `0x07` events. See the
 [review comment](https://github.com/Sapd/HeadsetControl/pull/584#issuecomment-6550334589)
 for the fix. This project doesn't need HeadsetControl.
+
+## Releasing
+
+1. Set the new version in both `VERSION` (`bin/arctis-omni`) and `pkgver`
+   (`packaging/arch/PKGBUILD`); reset `pkgrel` to 1. CI fails if they differ.
+2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+
+The Release workflow builds the package from the tag, fills in its checksum, and publishes a
+GitHub release with the package and PKGBUILD. To also publish to the AUR, add the private
+half of an SSH key registered on your AUR account as the repository secret
+`AUR_SSH_PRIVATE_KEY`. Without it, that step is skipped.
 
 ## License
 

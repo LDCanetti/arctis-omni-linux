@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 
+VERSION = "0.1.0"
 VENDOR = 0x1038
 EVENT = 0x07
 
@@ -471,6 +472,7 @@ def cmd_output(_hub, args):
 
 def main():
     p = argparse.ArgumentParser(prog="arctis-omni", description=__doc__.splitlines()[0])
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status", help="battery, noise mode, sidetone and ChatMix state")
     s.add_argument("--json", action="store_true")
