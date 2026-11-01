@@ -11,11 +11,15 @@ import fcntl
 import glob
 import json
 import os
+import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.request
 
 VERSION = "0.1.1"
 VENDOR = 0x1038
@@ -37,8 +41,17 @@ GAME_SINK = "arctis_omni_game"
 CHAT_SINK = "arctis_omni_chat"
 LOOPBACK_OUTPUTS = ("arctis_omni_game_out", "arctis_omni_chat_out")
 # Where Game/Chat play when not on the headset: a sink name, set with `arctis-omni output`.
-OUTPUT_STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
-                            "arctis-omni", "output")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                         "arctis-omni")
+OUTPUT_STATE = os.path.join(STATE_DIR, "output")
+FIRMWARE_STATE = os.path.join(STATE_DIR, "firmware.json")
+# Held while firmware is being written; other commands leave the device alone meanwhile.
+FLASH_LOCK = os.path.join(STATE_DIR, "flashing")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                         "arctis-omni")
+# SteelSeries ships firmware only inside GG; this link redirects to the latest installer,
+# whose file name carries the GG version.
+GG_LATEST_URL = "https://steelseries.com/gg/downloads/gg/latest/windows"
 
 
 class Omni:
@@ -79,6 +92,15 @@ class Omni:
     def default_sidetone(self, current):
         return current["sidetone_level"]
 
+    # Firmware: chips in the 0x10 reply (12-byte fields), and where GG keeps their files
+    # ({GG firmware folder PID: chips in its version.json order}).
+    fw_chips = ("base MCU 1", "base MCU 2", "base DSP", "headset MCU", "headset Bluetooth")
+    fw_bundles = {0x2290: {0x2290: ("base MCU 1", "base MCU 2", "base DSP"),
+                           0x2296: ("headset MCU", "headset Bluetooth")}}
+    flashable = ()
+    update_hint = ("Update with SteelSeries GG on Windows. Its updater only starts with the "
+                   "GameHub and the headset both connected to the PC by USB cable.")
+
 
 class NovaProWireless:
     name = "Arctis Nova Pro Wireless"
@@ -109,6 +131,13 @@ class NovaProWireless:
     def default_sidetone(self, _current):
         return 2
 
+    fw_chips = ("base DSP", "base MCU", "headset MCU", "headset Bluetooth")
+    fw_bundles = {pid: {pid: ("base DSP", "base MCU"), rx: ("headset MCU", "headset Bluetooth")}
+                  for pid, rx in ((0x12E0, 0x12E2), (0x12E5, 0x12E8), (0x225D, 0x2260))}
+    flashable = ()
+    update_hint = ("Update with SteelSeries GG on Windows, with the base station connected "
+                   "to the PC by USB.")
+
 
 class NovaProWired(NovaProWireless):
     # GameDAC Gen 2: same report ID, settings reply, sidetone and ChatMix as the Nova Pro
@@ -117,6 +146,12 @@ class NovaProWired(NovaProWireless):
     pids = (0x12CB, 0x12CD)  # PC, Xbox GameDACs
     wireless = False
     anc_writable = False
+
+    fw_chips = ("DSP", "MCU", "USB")
+    fw_bundles = {pid: {pid: ("DSP", "MCU", "USB")} for pid in (0x12CB, 0x12CD)}
+    # Flashing is verified on the PC GameDAC only (all three chips, 2026-11-01).
+    flashable = (0x12CB,)
+    update_hint = "Update with SteelSeries GG on Windows, with the GameDAC connected by USB."
 
 
 MODELS = (Omni(), NovaProWireless(), NovaProWired())
@@ -135,7 +170,7 @@ def find_hub():
                 continue
             with open(f"{node}/device/report_descriptor", "rb") as f:
                 if f.read(3) == b"\x06\xc0\xff":
-                    return "/dev/" + os.path.basename(node), model, usb_product(node)
+                    return "/dev/" + os.path.basename(node), model, usb_product(node), pid
         except (OSError, StopIteration, ValueError):
             continue
     return None
@@ -154,13 +189,57 @@ def usb_product(hidraw_node):
     return None
 
 
+# The open lock file while this process is updating firmware (an flock, so it's released
+# even if the updater dies).
+_flash_lock_fd = None
+
+
+def acquire_flash_lock():
+    global _flash_lock_fd
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd = os.open(FLASH_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    _flash_lock_fd = fd
+    return True
+
+
+def release_flash_lock():
+    global _flash_lock_fd
+    if _flash_lock_fd is not None:
+        os.close(_flash_lock_fd)
+        _flash_lock_fd = None
+
+
+def flash_lock_holder():
+    # True if another process is writing firmware.
+    if _flash_lock_fd is not None:
+        return False
+    try:
+        fd = os.open(FLASH_LOCK, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
 class Hub:
     def __init__(self):
+        if flash_lock_holder():
+            sys.exit("A firmware update is in progress; try again when it has finished")
         found = find_hub()
         if not found:
             sys.exit("No supported SteelSeries base station found "
                      "(Arctis Nova Pro Omni, Nova Pro Wireless or Nova Pro)")
-        self.path, self.model, self.product = found
+        self.path, self.model, self.product, self.pid = found
         try:
             self.fd = os.open(self.path, os.O_RDWR)
         except PermissionError:
@@ -188,6 +267,9 @@ class Hub:
 
     def settings(self):
         return self.model.settings(self)
+
+    def close(self):
+        os.close(self.fd)
 
 
 def cmd_status(hub, args):
@@ -224,6 +306,7 @@ def cmd_status(hub, args):
             "mic_volume": a["mic_volume"],
             "chatmix_game": a["chatmix_game"],
             "chatmix_chat": a["chatmix_chat"],
+            "firmware": firmware_summary(load_firmware_state(), hub.pid),
         }))
         return
     print(f"model:        {m.name}")
@@ -393,6 +476,9 @@ def cmd_chatmix_daemon(_hub, _args):
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     while not stop:
+        if flash_lock_holder():
+            time.sleep(3)
+            continue
         if not find_hub():
             # No headset to fall back to, but a saved output (e.g. speakers) still needs
             # routing after PipeWire recreates the loopbacks.
@@ -482,6 +568,550 @@ def cmd_output(_hub, args):
         sys.exit("Couldn't route Game/Chat (are the Arctis Game/Chat sinks loaded?)")
 
 
+# --- Firmware -----------------------------------------------------------------------
+
+USER_AGENT = {"User-Agent": f"arctis-omni/{VERSION}"}
+
+
+def parse_version(raw):
+    # Version fields come padded in different styles ("02.04.00", "0.3.82", NUL-filled);
+    # an all-zero field means the part isn't there (e.g. headset not paired).
+    text = raw.strip(b"\0").decode("ascii", "replace").strip()
+    parts = text.split(".")
+    if len(parts) < 2 or not all(p.isdigit() for p in parts):
+        return None
+    numbers = [int(p) for p in parts]
+    return ".".join(map(str, numbers)) if any(numbers) else None
+
+
+def version_key(version):
+    return tuple(int(p) for p in version.split("."))
+
+
+def device_versions(hub):
+    reply = hub.query(0x10)
+    return {chip: parse_version(reply[2 + 12 * i:14 + 12 * i])
+            for i, chip in enumerate(hub.model.fw_chips)}
+
+
+def gg_latest():
+    # (version, installer URL) of the latest GG, read from the download link's redirect.
+    request = urllib.request.Request(GG_LATEST_URL, method="HEAD", headers=USER_AGENT)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        url = response.geturl()
+    match = re.search(r"SteelSeriesGG([0-9.]+)Setup\.exe$", url)
+    if not match:
+        raise RuntimeError(f"Unexpected GG download link: {url}")
+    return match.group(1), url
+
+
+def bundle_folder(cache, pid):
+    return os.path.join(cache, "firmware", str((VENDOR << 16) | pid))
+
+
+def fetch_gg_firmware(version, url, log):
+    # Unpack only the firmware folders of supported devices from a GG release, once.
+    cache = os.path.join(CACHE_DIR, f"gg-{version}")
+    if os.path.isdir(os.path.join(cache, "firmware")):
+        return cache
+    if not shutil.which("7z"):
+        raise RuntimeError("7z is needed to unpack SteelSeries GG; install 7zip")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    pids = {pid for m in MODELS for folders in m.fw_bundles.values() for pid in folders}
+    with tempfile.TemporaryDirectory(dir=CACHE_DIR) as tmp:
+        installer = os.path.join(tmp, "gg.exe")
+        log(f"Downloading SteelSeries GG {version} to read the firmware in it (about 400 MB)…")
+        with urllib.request.urlopen(urllib.request.Request(url, headers=USER_AGENT), timeout=60) as response, \
+                open(installer, "wb") as f:
+            shutil.copyfileobj(response, f, 1 << 20)
+        subprocess.run(["7z", "x", "-y", "-bso0", "-bsp0", f"-o{tmp}/x", installer,
+                        "apps/engine/firmware/*"], check=True)
+        staged = os.path.join(tmp, "staged")
+        for pid in pids:
+            src = bundle_folder(os.path.join(tmp, "x", "apps", "engine"), pid)
+            if os.path.isdir(src):
+                shutil.copytree(src, bundle_folder(staged, pid))
+        os.makedirs(cache, exist_ok=True)
+        os.replace(os.path.join(staged, "firmware"), os.path.join(cache, "firmware"))
+    prune_caches(keep=cache)
+    return cache
+
+
+def prune_caches(keep):
+    # Remove older GG releases, unless an updater may still be reading one.
+    if flash_lock_holder():
+        return
+    for old in glob.glob(os.path.join(CACHE_DIR, "gg-*")):
+        if old != keep:
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def bundle_versions(cache, model, pid):
+    # {chip: (version, folder)} that GG ships for this device.
+    out = {}
+    for folder_pid, chips in model.fw_bundles.get(pid, {}).items():
+        folder = bundle_folder(cache, folder_pid)
+        try:
+            with open(os.path.join(folder, "version.json")) as f:
+                versions = json.load(f)["firmware_version"].split("/")
+        except (OSError, ValueError, KeyError):
+            continue
+        for chip, version in zip(chips, versions):
+            out[chip] = (version, folder)
+    return out
+
+
+def load_firmware_state():
+    try:
+        with open(FIRMWARE_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_firmware_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = FIRMWARE_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, FIRMWARE_STATE)
+
+
+def compare_device(state, hub):
+    # Record the connected device's firmware against the cached GG release.
+    current = device_versions(hub)
+    bundle = bundle_versions(state["cache"], hub.model, hub.pid) if state.get("cache") else {}
+    available = {chip: version for chip, (version, _folder) in bundle.items()}
+    updates = {chip: version for chip, version in available.items()
+               if current.get(chip) and version_key(version) > version_key(current[chip])}
+    state["device"] = {
+        "model": hub.model.name,
+        "pid": f"{hub.pid:04x}",
+        "current": current,
+        "available": available,
+        "updates": updates,
+        "flashable": hub.pid in hub.model.flashable,
+    }
+    return state
+
+
+def firmware_check(log=print):
+    version, url = gg_latest()
+    state = load_firmware_state()
+    state.update(gg_version=version, checked=time.strftime("%Y-%m-%d %H:%M"),
+                 cache=fetch_gg_firmware(version, url, log))
+    if find_hub():
+        hub = Hub()
+        try:
+            compare_device(state, hub)
+        finally:
+            hub.close()
+    save_firmware_state(state)
+    return state
+
+
+def firmware_summary(state, pid):
+    # The part of the saved check that belongs to this device, for `status --json`.
+    device = state.get("device")
+    if not device or device.get("pid") != f"{pid:04x}":
+        return None
+    return {"update_available": bool(device["updates"]), "updates": device["updates"],
+            "current": device["current"], "flashable": device["flashable"],
+            "gg_version": state.get("gg_version"), "checked": state.get("checked")}
+
+
+def notify_update(state):
+    device = state.get("device") or {}
+    if not device.get("updates"):
+        return
+    key = f"{device['pid']}:{sorted(device['updates'].items())}"
+    if state.get("notified") == key:
+        return
+    chips = ", ".join(f"{chip} {device['current'][chip]} → {v}" for chip, v in device["updates"].items())
+    # Stays until dismissed: a default popup is gone after a few seconds and easy to miss.
+    subprocess.run(["notify-send", "--app-name=Arctis", "--icon=audio-headset", "--expire-time=0",
+                    f"Firmware update for your {device['model']}",
+                    f"{chips}\nOpen the Arctis Headset Battery widget to update."], check=False)
+    state["notified"] = key
+    save_firmware_state(state)
+
+
+# Arctis Nova Pro (wired) GameDAC update protocol ("Berena" in GG): see the README.
+BERENA_CHIPS = (("USB", 0, "_4050_"), ("DSP", 1, "_5680_"), ("MCU", 3, "_mcu_"))
+BERENA_BOOT_PIDS = {0x12CB: 0x12CC}
+BERENA_BLOCK = 512
+
+
+def hidraw_nodes(pid):
+    nodes = []
+    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(f"{node}/device/uevent") as f:
+                if f"HID_ID=0003:{VENDOR:08X}:{pid:08X}" not in f.read().upper():
+                    continue
+            with open(f"{node}/device/report_descriptor", "rb") as f:
+                if f.read(3) == b"\x06\xc0\xff":
+                    nodes.append("/dev/" + os.path.basename(node))
+        except OSError:
+            continue
+    return nodes
+
+
+def hidraw_node(pid):
+    nodes = hidraw_nodes(pid)
+    return nodes[0] if nodes else None
+
+
+class BerenaLink:
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR)
+
+    def close(self):
+        os.close(self.fd)
+
+    def out(self, *payload):
+        os.write(self.fd, bytes([0x06, *payload]) + bytes(63 - len(payload)))
+
+    def block(self, chip, offset, data):
+        buf = bytearray(9 + BERENA_BLOCK)
+        buf[0:3] = bytes([0x06, 0xA4, chip])
+        buf[3:5] = (len(data) + 4).to_bytes(2, "little")
+        buf[5:9] = offset.to_bytes(4, "little")
+        buf[9:9 + len(data)] = data
+        fcntl.ioctl(self.fd, (3 << 30) | (len(buf) << 16) | (ord("H") << 8) | 0x06, buf)  # HIDIOCSFEATURE
+
+    def ack(self, what):
+        for _ in range(15):
+            if not select.select([self.fd], [], [], 10)[0]:
+                break
+            reply = os.read(self.fd, 64)
+            if reply[0] != 0x06:
+                continue  # event reports share the interface
+            if reply[2] == 0x5A:  # 'Z'
+                return
+            raise RuntimeError(f"{what}: the device answered {reply[:6].hex(' ')}")
+        raise RuntimeError(f"{what}: no answer from the device")
+
+
+def berena_flash_chip(app_pid, chip_name, chip, data, progress):
+    boot_pid = BERENA_BOOT_PIDS[app_pid]
+    path = hidraw_node(app_pid) or hidraw_node(boot_pid)
+    if not path:
+        raise RuntimeError("the GameDAC isn't connected")
+    link = BerenaLink(path)
+    try:
+        if path == hidraw_node(app_pid):
+            link.out(0x02, chip)
+            if chip == 0:
+                # The USB chip is updated from the bootloader, which re-enumerates.
+                link.close()
+                link = None
+                time.sleep(1)
+                deadline = time.time() + 20
+                while not (boot := hidraw_node(boot_pid)):
+                    if time.time() > deadline:
+                        raise RuntimeError("the GameDAC's bootloader didn't appear")
+                    time.sleep(0.1)
+                time.sleep(1)
+                link = BerenaLink(boot)
+            else:
+                link.ack("enter update mode")
+                time.sleep(1)
+        link.out(0xA2, chip)
+        time.sleep(1)
+        link.ack("start")
+        count = len(data) // BERENA_BLOCK if chip == 0 else -(-len(data) // BERENA_BLOCK)
+        blocks = [(i * BERENA_BLOCK, data[i * BERENA_BLOCK:(i + 1) * BERENA_BLOCK]) for i in range(count)]
+        if chip in (1, 2):
+            blocks = [(o, d) for o, d in blocks if d != b"\xff" * len(d)]  # blank DSP blocks
+        for n, (offset, chunk) in enumerate(blocks, 1):
+            link.block(chip, offset, chunk)
+            link.ack(f"{chip_name} block at {offset:#x}")
+            progress(chip_name, n, len(blocks))
+        time.sleep(1)
+        link.out(0xA8, chip, 0, 0)
+        if chip != 0:
+            link.ack(f"{chip_name} finish")
+        time.sleep(1)
+    except BaseException:
+        if link:
+            try:
+                link.out(0xA8, chip)  # GG reboots the chip when an update fails
+            except OSError:
+                pass
+        raise
+    finally:
+        if link:
+            link.close()
+
+
+def firmware_file(folder, pattern, version):
+    for path in glob.glob(os.path.join(folder, "*")):
+        name = os.path.basename(path)
+        if pattern in name and f"_v{version}." in name:
+            return path
+    raise RuntimeError(f"no {pattern.strip('_')} v{version} file in {folder}")
+
+
+def pause(prompt="Press Enter to close…"):
+    try:
+        input(prompt)
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
+
+
+def show_versions(device):
+    print(f"\n  {'part':20} {'installed':12} available")
+    for chip, current in device["current"].items():
+        available = device["available"].get(chip, "-")
+        mark = "  ← update" if chip in device["updates"] else ""
+        print(f"  {chip:20} {current or '-':12} {available}{mark}")
+    print()
+
+
+def say(*args, **kwargs):
+    # print() that survives the terminal having been closed.
+    try:
+        print(*args, **kwargs)
+    except OSError:
+        pass
+
+
+class FlashInterrupted(RuntimeError):
+    pass
+
+
+class FlashSignals:
+    # While firmware is being written: Ctrl+C is ignored, closing the terminal lets the
+    # update run to the end without output, and SIGTERM aborts it the way GG does (the
+    # chip's reboot command), still releasing the lock and restarting ChatMix.
+    signals = (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+
+    def __enter__(self):
+        self.saved = {sig: signal.getsignal(sig) for sig in self.signals}
+        signal.signal(signal.SIGINT, lambda *_: say("\n  (Ctrl+C is ignored while firmware is being written)"))
+        signal.signal(signal.SIGHUP, self.on_hangup)
+        signal.signal(signal.SIGTERM, self.on_term)
+        return self
+
+    def __exit__(self, *_exc):
+        for sig, handler in self.saved.items():
+            signal.signal(sig, handler)
+
+    @staticmethod
+    def on_hangup(*_):
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+
+    @staticmethod
+    def on_term(*_):
+        raise FlashInterrupted("stopped by SIGTERM")
+
+
+def gamedac_nodes():
+    # Command nodes of every connected GameDAC we can flash, in app or bootloader mode.
+    pids = (*BERENA_BOOT_PIDS, *BERENA_BOOT_PIDS.values())
+    return [node for pid in pids for node in hidraw_nodes(pid)]
+
+
+def bootloader_app_pid():
+    # App PID of a GameDAC that's sitting in its bootloader (an interrupted update), if any.
+    return next((app for app, boot in BERENA_BOOT_PIDS.items() if hidraw_node(boot)), None)
+
+
+def run_flash(state, app_pid, chips, versions):
+    # Flash the given (name, chip id, file pattern) chips. True on success.
+    found = len(gamedac_nodes())
+    if found != 1:
+        say(f"Connect exactly one Arctis Nova Pro GameDAC while updating (found {found}).")
+        return False
+    # Read every image first, so a cache change can't pull a file away mid-update.
+    images = []
+    try:
+        for chip_name, chip, pattern in chips:
+            version = versions[chip_name]
+            with open(firmware_file(bundle_folder(state["cache"], app_pid), pattern, version), "rb") as f:
+                images.append((chip_name, chip, version, f.read()))
+    except (RuntimeError, OSError) as e:
+        say(f"Couldn't read the firmware files: {e}")
+        return False
+    if not acquire_flash_lock():
+        say("Another firmware update is already running.")
+        return False
+
+    def progress(chip_name, n, total):
+        say(f"\r  {chip_name}: {100 * n // total:3d}% ({n}/{total})", end="", flush=True)
+
+    service = "arctis-omni-chatmix.service"
+    was_active = False
+    failed = None
+    with FlashSignals():
+        try:
+            was_active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", service]).returncode == 0
+            if was_active:
+                subprocess.run(["systemctl", "--user", "stop", service], check=False)
+            time.sleep(2)
+            for chip_name, chip, version, data in images:
+                say(f"Writing {chip_name} firmware {version}…")
+                berena_flash_chip(app_pid, chip_name, chip, data, progress)
+                say(" done")
+                time.sleep(2)
+        except (RuntimeError, OSError) as e:
+            failed = e
+        finally:
+            release_flash_lock()
+            # Let the GameDAC finish rebooting before anything talks to it again.
+            deadline = time.time() + 20
+            while not hidraw_node(app_pid) and time.time() < deadline:
+                time.sleep(0.5)
+            time.sleep(3)
+            if was_active:
+                subprocess.run(["systemctl", "--user", "start", service], check=False)
+    if failed:
+        say(f"\n\nThe update FAILED: {failed}")
+        say("Leave the GameDAC connected and run the update again. If it was left in its "
+            "bootloader, the updater will offer to recover it.")
+        return False
+    return True
+
+
+def refresh_device(state):
+    if find_hub():
+        hub = Hub()
+        try:
+            compare_device(state, hub)
+        finally:
+            hub.close()
+        save_firmware_state(state)
+
+
+def ask(prompt, answer):
+    try:
+        return input(prompt).strip() == answer
+    except (EOFError, KeyboardInterrupt, OSError):
+        say()
+        return False
+
+
+def cmd_firmware_update(_args):
+    print(f"Arctis firmware update (arctis-omni {VERSION})\n")
+    try:
+        state = firmware_check()
+    except Exception as e:
+        print(f"Couldn't check for firmware: {e}")
+        # Recovering an interrupted update can still use an earlier check's files.
+        state = load_firmware_state()
+        if not (state.get("cache") and bootloader_app_pid()):
+            return pause()
+
+    recovering = bootloader_app_pid()
+    if recovering:
+        model = next(m for m in MODELS if recovering in m.pids)
+        usb = bundle_versions(state["cache"], model, recovering).get("USB", (None,))[0]
+        print(f"An {model.name} GameDAC is in its bootloader: a firmware update was interrupted.")
+        if not usb:
+            print("No USB firmware for it in the cached SteelSeries GG release; check your connection and retry.")
+            return pause()
+        print(f"Re-installing its USB firmware ({usb}) brings it back.\n")
+        if not ask("Type 'recover' to start: ", "recover"):
+            return print("Cancelled; nothing was changed.")
+        if not run_flash(state, recovering, [BERENA_CHIPS[0]], {"USB": usb}):
+            return pause()
+        print("\nRecovered.")
+        refresh_device(state)
+        if state.get("device"):
+            show_versions(state["device"])
+            if state["device"]["updates"]:
+                print("Run the update again to install the rest.")
+        return pause()
+
+    while not state.get("device") or not find_hub():
+        print("Connect your headset's base station or GameDAC to this PC with its USB cable.")
+        try:
+            input("Press Enter when it's connected (Ctrl+C to quit)… ")
+        except (EOFError, KeyboardInterrupt):
+            return print()
+        refresh_device(state)
+    device = state["device"]
+    print(f"{device['model']}, firmware from SteelSeries GG {state['gg_version']}:")
+    show_versions(device)
+    model = next(m for m in MODELS if m.name == device["model"])
+    if not device["flashable"]:
+        print("Updating this model from Linux isn't supported yet.")
+        print(model.update_hint)
+        return pause()
+    chips = [c for c in BERENA_CHIPS if c[0] in device["updates"]]
+    if not chips:
+        print("Everything is up to date.")
+        if not ask("Re-install the current firmware anyway? Type 'reinstall' to do so: ", "reinstall"):
+            return
+        chips = list(BERENA_CHIPS)
+    print("Before starting:")
+    print("  • Connect the GameDAC to this PC directly with its USB cable (not through a USB hub),")
+    print("    with the headset plugged into the GameDAC.")
+    print("  • Don't unplug anything until it says it's finished (about a minute).")
+    print("  • Updating the MCU resets the GameDAC's settings (sidetone, EQ…) to their defaults.\n")
+    if not ask("Type 'update' to start: ", "update"):
+        return print("Cancelled; nothing was changed.")
+    if not run_flash(state, int(device["pid"], 16), chips, device["available"]):
+        return pause()
+    refresh_device(state)
+    say("\nFinished. Firmware now:")
+    if state.get("device"):
+        show_versions(state["device"])
+    pause()
+
+
+def terminal_command(cmd):
+    # The desktop's configured terminal first (KDE), then common ones.
+    candidates = []
+    try:
+        configured = subprocess.run(["kreadconfig6", "--file", "kdeglobals", "--group", "General",
+                                     "--key", "TerminalApplication"], capture_output=True, text=True).stdout.strip()
+        if configured:
+            candidates.append(configured.split()[0])
+    except OSError:
+        pass
+    candidates += ["xdg-terminal-exec", "konsole", "ghostty", "kitty", "alacritty", "foot",
+                   "gnome-terminal", "xterm"]
+    for name in candidates:
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        base = os.path.basename(exe)
+        if base in ("kitty", "foot", "xdg-terminal-exec"):
+            return [exe, *cmd]
+        if base == "gnome-terminal":
+            return [exe, "--", *cmd]
+        return [exe, "-e", *cmd]
+    return None
+
+
+def cmd_firmware(_hub, args):
+    if args.action == "check":
+        try:
+            state = firmware_check(log=print if not args.notify else (lambda *_: None))
+        except Exception as e:
+            sys.exit(f"Firmware check failed: {e}")
+        if args.notify:
+            notify_update(state)
+        device = state.get("device")
+        print(f"Latest SteelSeries GG: {state['gg_version']}")
+        if device:
+            print(f"{device['model']}:")
+            show_versions(device)
+            print("Update available." if device["updates"] else "Up to date.")
+        else:
+            print("No supported headset connected.")
+    elif args.action == "update":
+        cmd_firmware_update(args)
+    elif args.action == "open":
+        term = terminal_command([os.path.realpath(sys.argv[0]), "firmware", "update"])
+        if not term:
+            sys.exit("No terminal found; run 'arctis-omni firmware update' in a terminal")
+        subprocess.Popen(term, start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def main():
     p = argparse.ArgumentParser(prog="arctis-omni", description=__doc__.splitlines()[0])
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -505,8 +1135,14 @@ def main():
     s = sub.add_parser("output", help="where Game/Chat play: show, 'headset', or an output's sink name")
     s.add_argument("target", nargs="?")
     s.set_defaults(func=cmd_output)
+    s = sub.add_parser("firmware", help="check for, or install, firmware updates from SteelSeries GG")
+    s.add_argument("action", choices=("check", "update", "open"),
+                   help="check: compare with the latest GG; update: interactive updater; "
+                        "open: run the updater in a terminal")
+    s.add_argument("--notify", action="store_true", help="with check: desktop notification if there's an update")
+    s.set_defaults(func=cmd_firmware)
     args = p.parse_args()
-    needs_hub = args.command not in ("chatmix-daemon", "output")
+    needs_hub = args.command not in ("chatmix-daemon", "output", "firmware")
     args.func(Hub() if needs_hub else None, args)
 
 

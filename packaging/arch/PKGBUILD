@@ -6,8 +6,9 @@ pkgdesc="Controls for SteelSeries Arctis Nova Pro headsets: ANC, sidetone, ChatM
 arch=('any')
 url="https://github.com/LDCanetti/arctis-omni-linux"
 license=('MIT')
-depends=('python' 'pipewire' 'pipewire-pulse' 'libpulse' 'wireplumber')
-optdepends=('plasma-workspace: panel widget')
+depends=('python' 'pipewire' 'pipewire-pulse' 'libpulse' 'wireplumber' '7zip')
+optdepends=('plasma-workspace: panel widget'
+            'libnotify: firmware update notifications')
 install=arctis-omni-linux.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # The release workflow replaces this with the real checksum (updpkgsums) before publishing.
@@ -24,8 +25,13 @@ package() {
 
     # The per-user files point at ~/.local/bin; the package installs to /usr/bin.
     install -d "$pkgdir/usr/lib/systemd/user"
-    sed 's|%h/.local/bin/arctis-omni|/usr/bin/arctis-omni|' systemd/arctis-omni-chatmix.service \
-        > "$pkgdir/usr/lib/systemd/user/arctis-omni-chatmix.service"
+    local unit
+    for unit in arctis-omni-chatmix.service arctis-omni-firmware-check.service; do
+        sed 's|%h/.local/bin/arctis-omni|/usr/bin/arctis-omni|' "systemd/$unit" \
+            > "$pkgdir/usr/lib/systemd/user/$unit"
+    done
+    install -Dm644 systemd/arctis-omni-firmware-check.timer \
+        "$pkgdir/usr/lib/systemd/user/arctis-omni-firmware-check.timer"
 
     local plasmoid="$pkgdir/usr/share/plasma/plasmoids/local.arctis-omni-battery"
     install -d "$plasmoid"

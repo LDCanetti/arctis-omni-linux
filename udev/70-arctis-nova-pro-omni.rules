@@ -8,3 +8,5 @@ KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1038", ATTRS{idProduct
 # Arctis Nova Pro (wired, GameDAC Gen 2: PC, Xbox)
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12cb", TAG+="uaccess"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12cd", TAG+="uaccess"
+# Arctis Nova Pro (wired) GameDAC bootloader, used while updating its firmware
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12cc", TAG+="uaccess"
