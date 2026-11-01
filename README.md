@@ -199,8 +199,9 @@ Nova Pro Wireless. The `BD` and `B9` writes were found to work on it by testing,
 ## Firmware updates
 
 SteelSeries publishes headset firmware only inside SteelSeries GG releases. A daily timer
-(`arctis-omni-firmware-check.timer`) asks SteelSeries' download link which GG version is
-current. When a new one appears, it downloads that installer once (about 400 MB), keeps only
+(`arctis-omni-firmware-check.timer`) asks SteelSeries' update server (the one GG itself
+uses) which GG version is current. When a new one appears, it downloads that installer once
+(about 400 MB), checks it against the server's checksum, keeps only
 the firmware for supported headsets in `~/.cache/arctis-omni` (about 20 MB), and compares it
 with what the connected headset reports. If anything is newer, you get a desktop
 notification, and the widget shows **Update available** with an **Update…** button.
@@ -215,19 +216,32 @@ arctis-omni firmware update   # the interactive updater (the widget's button ope
 | Arctis Nova Pro (wired, PC GameDAC `12cb`) | ✅ USB, DSP and MCU chips, the same way GG does it. Verified by re-flashing all three. Updating the MCU resets the GameDAC's settings to their defaults. |
 | Arctis Nova Pro (wired, Xbox GameDAC `12cd`) | Check only. Same method, but untested; update with GG. |
 | Arctis Nova Pro Omni | Check only; update with GG on Windows. GG's updater only starts with **both the GameHub and the headset connected to the PC by USB cable**. |
-| Arctis Nova Pro Wireless | Check only; update with GG on Windows. |
+| Arctis Nova Pro Wireless (Xbox base station `12e5`) | ✅ Base station DSP and MCU, headset MCU and Bluetooth, the same way GG does it. The headset's chips are written over **the headset's own USB cable**; the updater asks you to plug it in (or to skip the headset). Verified by re-flashing the base DSP and MCU and the headset Bluetooth chip of a v2 headset. The headset MCU path is GG's (shared with the base MCU) but hasn't been run. |
+| Arctis Nova Pro Wireless (PC `12e0`, Xbox white `225d`) | Check only. Same method, but untested; update with GG. |
 
 For models that are check-only, the Update button explains how to update with GG instead of
 flashing. While the updater writes firmware, it:
 - pauses the ChatMix service and holds a lock, so the widget and other commands leave the
   device alone;
 - ignores Ctrl+C, and keeps going if its terminal is closed. SIGTERM aborts cleanly;
-- refuses to start with more than one GameDAC connected.
+- refuses to start with more than one GameDAC or Nova Pro Wireless base station connected;
+- reinstalls only what's already on the version GG ships, so it never downgrades a part.
 
 If a GameDAC update is interrupted anyway, the GameDAC may not show up until it's replugged.
 It then comes back as **SteelSeries Bootloader** (`1038:12cc`), and running
 `arctis-omni firmware update` again offers to recover it. Recovery was tested by killing an
 update halfway through the USB chip.
+
+A Nova Pro Wireless base station or headset whose MCU update is interrupted should stay in
+its bootloader (**SteelSeries Bootloader**, e.g. `1038:12e7` for the Xbox base station); the
+updater then offers to recover it the same way. That hasn't been tested by interrupting one.
+A bootloader with intact firmware behind it goes back to that firmware by itself after 5 s
+(verified). The Bluetooth chip uses Qualcomm's upgrade process, which writes the new image
+next to the running one and switches only at the end; an interrupted Bluetooth update hasn't
+been tested either.
+
+A Nova Pro Wireless headset doesn't connect to its base station while it's on a USB cable;
+unplug it after the update (the updater waits for it to come back).
 
 On Omni firmware 1.32.0, the knob only enters ChatMix mode if software ChatMix is enabled
 *before* Sonar present, after both have been cleared. The service does this, and waits 5 s
