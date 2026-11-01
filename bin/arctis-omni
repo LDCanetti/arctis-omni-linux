@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Control the SteelSeries Arctis Nova Pro Omni GameHub (1038:2290) over hidraw.
+"""Control SteelSeries Arctis Nova Pro Omni / Nova Pro Wireless / Nova Pro (wired) over hidraw.
 
 Protocol derived from SteelSeries GG's device definitions, for interoperability:
-commands are 64-byte output reports with report ID 0x01 on the usage-page 0xFFC0
-collection; the hub pushes events as report ID 0x07.
+commands are 64-byte output reports on the usage-page 0xFFC0 collection (report ID 0x01
+on the Omni, 0x06 on the Nova Pro models); the hubs push events as report ID 0x07 on the
+same interface.
 """
 import argparse
 import fcntl
@@ -16,49 +17,152 @@ import subprocess
 import sys
 import time
 
-VID_PID = "00001038:00002290"
-REPORT = 0x01
+VENDOR = 0x1038
 EVENT = 0x07
 
 CMD_STATUS = 0xB0
 CMD_AUDIO_SETTINGS = 0x20
-CMD_SIDETONE = 0x38
 CMD_ANC_LEVEL = 0xB8
 CMD_TRANSPARENT_LEVEL = 0xB9
 CMD_ANC_MODE = 0xBD
 CMD_SOFTWARE_CHATMIX = 0x49
+CMD_SONAR_PRESENT = 0x8D
 EV_CHATMIX = 0x45
 
 ANC_MODES = {"off": 0, "transparency": 1, "anc": 2}
 GAME_SINK = "arctis_omni_game"
 CHAT_SINK = "arctis_omni_chat"
+LOOPBACK_OUTPUTS = ("arctis_omni_game_out", "arctis_omni_chat_out")
 
 
-def find_hidraw():
-    # The hub exposes two hidraw nodes; the command channel's report descriptor
-    # starts with Usage Page 0xFFC0 (06 C0 FF).
+class Omni:
+    name = "Arctis Nova Pro Omni"
+    pids = (0x2290,)
+    report = 0x01
+    wireless = True  # has the B0 battery/link/noise-mode status
+    battery_steps = 100  # status bytes are already percentages
+    anc_writable = True
+    anc_level_supported = True
+    sidetone_max = 10
+
+    def settings(self, hub):
+        # The settings block is a 1036-byte feature report, fetched after a 0x20 request.
+        hub.send(CMD_AUDIO_SETTINGS)
+        time.sleep(0.1)
+        size = 1037
+        buf = bytearray(size)
+        buf[0] = self.report
+        fcntl.ioctl(hub.fd, (3 << 30) | (size << 16) | (ord("H") << 8) | 0x07, buf)  # HIDIOCGFEATURE
+        # Layout: command, 2x10 EQ bands of 6 bytes, 10 BT + 10 mic gains, then settings.
+        b = 1 + 60 + 60 + 20
+        return {
+            "mic_volume": buf[b + 4],
+            "sidetone_level": buf[b + 5],
+            "sidetone_on": bool(buf[b + 28]),
+            "chatmix_game": buf[b + 10],
+            "chatmix_chat": buf[b + 11],
+        }
+
+    def set_sidetone(self, hub, level, current):
+        # Separate on/off flag; turning it off keeps the stored level.
+        if level == 0:
+            hub.send(0x38, 0, current["sidetone_level"])
+        else:
+            hub.send(0x38, 1, level)
+
+    def default_sidetone(self, current):
+        return current["sidetone_level"]
+
+
+class NovaProWireless:
+    name = "Arctis Nova Pro Wireless"
+    pids = (0x12E0, 0x12E5, 0x225D)  # PC, Xbox, Xbox white base stations
+    report = 0x06
+    wireless = True
+    battery_steps = 8  # status bytes are 0-8 (12.5% steps)
+    # GG only reads the noise mode on this model, but the hub accepts the Omni's 0xBD
+    # (mode) and 0xB9 (transparency level) commands, verified on hardware. There's no
+    # ANC strength in its status, so 0xB8 is left out.
+    anc_writable = True
+    anc_level_supported = False
+    sidetone_max = 3
+
+    def settings(self, hub):
+        s = hub.query(CMD_AUDIO_SETTINGS)
+        return {
+            "mic_volume": s[17],
+            "sidetone_level": s[18],
+            "sidetone_on": s[18] > 0,
+            "chatmix_game": s[20],
+            "chatmix_chat": s[21],
+        }
+
+    def set_sidetone(self, hub, level, _current):
+        hub.send(0x39, level)  # 0 off, 1 low, 2 medium, 3 high
+
+    def default_sidetone(self, _current):
+        return 2
+
+
+class NovaProWired(NovaProWireless):
+    # GameDAC Gen 2: same report ID, settings reply, sidetone and ChatMix as the Nova Pro
+    # Wireless, but a wired headset has no battery/link status and no ANC.
+    name = "Arctis Nova Pro"
+    pids = (0x12CB, 0x12CD)  # PC, Xbox GameDACs
+    wireless = False
+    anc_writable = False
+
+
+MODELS = (Omni(), NovaProWireless(), NovaProWired())
+
+
+def find_hub():
+    # Each hub has a hidraw node whose report descriptor starts with Usage Page 0xFFC0
+    # (06 C0 FF); that node also carries the 0x07 event collection.
     for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
         try:
             with open(f"{node}/device/uevent") as f:
-                if f"HID_ID=0003:{VID_PID}" not in f.read().upper():
-                    continue
+                hid_id = next(l.split("=", 1)[1] for l in f.read().splitlines() if l.startswith("HID_ID="))
+            _bus, vid, pid = (int(x, 16) for x in hid_id.split(":"))
+            model = next((m for m in MODELS if vid == VENDOR and pid in m.pids), None)
+            if not model:
+                continue
             with open(f"{node}/device/report_descriptor", "rb") as f:
                 if f.read(3) == b"\x06\xc0\xff":
-                    return "/dev/" + os.path.basename(node)
-        except OSError:
+                    return "/dev/" + os.path.basename(node), model, usb_product(node)
+        except (OSError, StopIteration, ValueError):
             continue
+    return None
+
+
+def usb_product(hidraw_node):
+    # Walk up from the HID device to the USB device, which holds the product string
+    # that PipeWire's ALSA sink name is built from.
+    path = os.path.realpath(f"{hidraw_node}/device")
+    while path != "/":
+        try:
+            with open(f"{path}/product") as f:
+                return f.read().strip()
+        except OSError:
+            path = os.path.dirname(path)
     return None
 
 
 class Hub:
     def __init__(self):
-        path = find_hidraw()
-        if not path:
-            sys.exit("Arctis Nova Pro Omni GameHub not found")
-        self.fd = os.open(path, os.O_RDWR)
+        found = find_hub()
+        if not found:
+            sys.exit("No supported SteelSeries base station found "
+                     "(Arctis Nova Pro Omni, Nova Pro Wireless or Nova Pro)")
+        self.path, self.model, self.product = found
+        try:
+            self.fd = os.open(self.path, os.O_RDWR)
+        except PermissionError:
+            sys.exit(f"No permission to open {self.path} ({self.model.name}); "
+                     "install the udev rule (./install.sh) and replug the device")
 
     def send(self, *payload):
-        os.write(self.fd, bytes([REPORT, *payload]) + bytes(63 - len(payload)))
+        os.write(self.fd, bytes([self.model.report, *payload]) + bytes(63 - len(payload)))
 
     def read(self, timeout):
         if not select.select([self.fd], [], [], timeout)[0]:
@@ -72,83 +176,102 @@ class Hub:
             deadline = time.time() + 2
             while time.time() < deadline:
                 d = self.read(deadline - time.time())
-                if d and d[0] == REPORT and d[1] == cmd:
+                if d and d[0] == self.model.report and d[1] == cmd:
                     return d
         sys.exit(f"no reply to command {cmd:#04x}")
 
-    def audio_settings(self):
-        self.send(CMD_AUDIO_SETTINGS)
-        time.sleep(0.1)
-        size = 1037
-        buf = bytearray(size)
-        buf[0] = REPORT
-        fcntl.ioctl(self.fd, (3 << 30) | (size << 16) | (ord("H") << 8) | 0x07, buf)  # HIDIOCGFEATURE
-        # Layout: command, 2x10 EQ bands of 6 bytes, 10 BT + 10 mic gains, then settings.
-        b = 1 + 60 + 60 + 20
-        return {
-            "mic_volume": buf[b + 4],
-            "sidetone_level": buf[b + 5],
-            "chatmix_game": buf[b + 10],
-            "chatmix_chat": buf[b + 11],
-            "sidetone_on": buf[b + 28],
-        }
+    def settings(self):
+        return self.model.settings(self)
 
 
 def cmd_status(hub, args):
-    s = hub.query(CMD_STATUS)
-    a = hub.audio_settings()
-    mode = {v: k for k, v in ANC_MODES.items()}.get(s[10], s[10])
-    connected = s[14] == 0x08
-    if args.json:
-        print(json.dumps({
-            "connected": connected,
-            "battery": s[6],
-            "charger_battery": s[7],
+    m = hub.model
+    a = hub.settings()
+    if m.wireless:
+        s = hub.query(CMD_STATUS)
+        mode = {v: k for k, v in ANC_MODES.items()}.get(s[10], s[10])
+        st = {
+            "connected": s[14] == 0x08,
+            "battery": s[6] * 100 // m.battery_steps,
+            "charger_battery": s[7] * 100 // m.battery_steps,
             "charging": s[15] == 0x02,
             "noise_mode": mode,
-            "anc_level": s[16],
+            "anc_level": s[16] if m.anc_level_supported else None,
             "transparency_level": s[8],
-            "sidetone_on": bool(a["sidetone_on"]),
-            "sidetone_level": a["sidetone_level"],
-            "mic_volume": a["mic_volume"],
             "mic_muted": bool(s[9]),
+        }
+    else:
+        # Wired: the headset is there whenever the GameDAC is; nothing to report on
+        # battery, noise mode or mute.
+        st = dict.fromkeys(("battery", "charger_battery", "charging", "noise_mode", "anc_level",
+                            "transparency_level", "mic_muted"))
+        st["connected"] = True
+    if args.json:
+        print(json.dumps({
+            "model": m.name,
+            "wireless": m.wireless,
+            **st,
+            "anc_writable": m.anc_writable,
+            "sidetone_on": a["sidetone_on"],
+            "sidetone_level": a["sidetone_level"],
+            "sidetone_max": m.sidetone_max,
+            "mic_volume": a["mic_volume"],
             "chatmix_game": a["chatmix_game"],
             "chatmix_chat": a["chatmix_chat"],
         }))
         return
-    print(f"headset:      {'connected' if connected else 'not connected'}")
-    if connected:
-        print(f"battery:      {s[6]}%")
-    print(f"charger:      {s[7]}%")
-    print(f"noise mode:   {mode}  (ANC level {s[16]}/3, transparency level {s[8]}/10)")
-    print(f"sidetone:     {'on' if a['sidetone_on'] else 'off'}, level {a['sidetone_level']}/10")
-    print(f"mic:          volume {a['mic_volume']}/10, {'muted' if s[9] else 'unmuted'}")
+    print(f"model:        {m.name}")
+    if m.wireless:
+        print(f"headset:      {'connected' if st['connected'] else 'not connected'}")
+        if st["connected"]:
+            print(f"battery:      {st['battery']}%")
+        print(f"spare:        {st['charger_battery']}%")
+        levels = f"ANC level {st['anc_level']}/3, " if st["anc_level"] is not None else ""
+        note = "" if m.anc_writable else "; change it on the headset"
+        print(f"noise mode:   {st['noise_mode']}  ({levels}transparency level {st['transparency_level']}/10{note})")
+    else:
+        print("headset:      wired")
+    sidetone = f"on, level {a['sidetone_level']}/{m.sidetone_max}" if a["sidetone_on"] else "off"
+    print(f"sidetone:     {sidetone}")
+    muted = "" if st["mic_muted"] is None else ", muted" if st["mic_muted"] else ", unmuted"
+    print(f"mic:          volume {a['mic_volume']}/10{muted}")
     print(f"chatmix dial: game {a['chatmix_game']}%, chat {a['chatmix_chat']}%")
 
 
+def require_anc(hub):
+    if not hub.model.anc_writable:
+        sys.exit(f"The {hub.model.name} has no noise cancelling or transparency mode")
+
+
 def cmd_anc(hub, args):
+    require_anc(hub)
     hub.send(CMD_ANC_MODE, ANC_MODES[args.mode])
 
 
 def cmd_anc_level(hub, args):
+    require_anc(hub)
+    if not hub.model.anc_level_supported:
+        sys.exit(f"The {hub.model.name} doesn't have an adjustable ANC strength")
     hub.send(CMD_ANC_LEVEL, args.level)
 
 
 def cmd_transparency_level(hub, args):
+    require_anc(hub)
     hub.send(CMD_TRANSPARENT_LEVEL, args.level)
 
 
 def cmd_sidetone(hub, args):
-    a = hub.audio_settings()
-    if args.value == "on":
-        hub.send(CMD_SIDETONE, 1, a["sidetone_level"])
-    elif args.value == "off":
-        hub.send(CMD_SIDETONE, 0, a["sidetone_level"])
+    m = hub.model
+    current = hub.settings()
+    if args.value == "off":
+        level = 0
+    elif args.value == "on":
+        level = m.default_sidetone(current) or 1
     else:
         level = int(args.value) if args.value.isdigit() else 0
-        if not 1 <= level <= 10:
-            sys.exit("sidetone level must be 1-10, on or off")
-        hub.send(CMD_SIDETONE, 1, level)
+        if not 1 <= level <= m.sidetone_max:
+            sys.exit(f"sidetone level must be 1-{m.sidetone_max}, on or off for the {m.name}")
+    m.set_sidetone(hub, level, current)
 
 
 def set_volume(sink, percent):
@@ -157,9 +280,52 @@ def set_volume(sink, percent):
     return result.returncode == 0
 
 
+def find_sink(product):
+    # The connected headset's ALSA sink. Its name changes with the card profile (e.g.
+    # analog-stereo vs. pro-output-0), so callers re-check it rather than caching it.
+    if not product:
+        return None
+    try:
+        sinks = subprocess.run(["pactl", "list", "short", "sinks"], check=True,
+                               capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    # The trailing "-" keeps "Arctis Nova Pro" from matching "Arctis Nova Pro Wireless/Omni".
+    prefix = "alsa_output.usb-SteelSeries_" + product.replace(" ", "_") + "-"
+    return next((line.split("\t")[1] for line in sinks.splitlines()
+                 if line.split("\t")[1:2] and line.split("\t")[1].startswith(prefix)), None)
+
+
+def route_outputs(target):
+    # Point the Game/Chat loopbacks at this sink via PipeWire's routing metadata, so the
+    # same sinks follow whichever headset is connected.
+    try:
+        dump = json.loads(subprocess.run(["pw-dump"], check=True, capture_output=True,
+                                         text=True).stdout)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return False
+    ids = {o["info"]["props"].get("node.name"): o["id"] for o in dump
+           if o.get("type") == "PipeWire:Interface:Node" and o.get("info")}
+    if not all(name in ids for name in LOOPBACK_OUTPUTS):
+        return False
+    for name in LOOPBACK_OUTPUTS:
+        result = subprocess.run(["pw-metadata", "-n", "default", str(ids[name]), "target.object", target],
+                                check=False, capture_output=True)
+        if result.returncode != 0:
+            return False
+    return True
+
+
+def valid_mix(game, chat):
+    # A real dial position always has one side at 100 (100/100 is the centre). A hub that
+    # has just connected reports 0/0 until it has finished starting up.
+    return max(game, chat) == 100
+
+
 def cmd_chatmix_daemon(_hub, _args):
-    # Puts the hub in software-ChatMix mode (as GG/Sonar does) and mirrors the dial
-    # onto the Game/Chat loopback sinks. Reconnects if the hub goes away.
+    # Puts the hub in software-ChatMix mode and tells it a mixer ("Sonar") is present, as
+    # GG does while Sonar runs, then mirrors the dial onto the Game/Chat loopback sinks.
+    # Reconnects if the hub goes away; clears both flags on exit, as GG does on shutdown.
     stop = False
 
     def on_signal(*_):
@@ -169,25 +335,42 @@ def cmd_chatmix_daemon(_hub, _args):
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     while not stop:
-        path = find_hidraw()
-        if not path:
+        if not find_hub():
             time.sleep(3)
             continue
         hub = None
         try:
             hub = Hub()
+            hub.send(CMD_SONAR_PRESENT, 1)
             hub.send(CMD_SOFTWARE_CHATMIX, 1)
-            a = hub.audio_settings()
-            mix = (a["chatmix_game"], a["chatmix_chat"])
-            print(f"chatmix active on {path}: game {mix[0]}% chat {mix[1]}%", flush=True)
-            # Applied flag stays False until both sinks accept the volume, so a mix that
-            # failed (sinks not up yet, PipeWire restarting) is retried every second.
+            print(f"chatmix active on {hub.path} ({hub.model.name})", flush=True)
+            # The dial position, routing and volumes are retried every second until they
+            # succeed (hub still starting up, sinks not up yet, PipeWire restarting). Until
+            # the dial position is known the volumes are left alone rather than zeroed.
+            mix = None
             applied = False
+            routed_to = None
+            next_route_check = 0.0
             while not stop:
-                if not applied:
+                if mix is None:
+                    a = hub.settings()
+                    if valid_mix(a["chatmix_game"], a["chatmix_chat"]):
+                        mix = (a["chatmix_game"], a["chatmix_chat"])
+                        applied = False
+                        print(f"dial at game {mix[0]}% chat {mix[1]}%", flush=True)
+                if time.monotonic() >= next_route_check:
+                    target = find_sink(hub.product)
+                    if target and target != routed_to and route_outputs(target):
+                        routed_to = target
+                        print(f"game/chat outputs routed to {target}", flush=True)
+                    # Retry every second until routed, then re-check every 10 s in case the
+                    # sink was renamed (card profile change).
+                    settled = target is not None and target == routed_to
+                    next_route_check = time.monotonic() + (10 if settled else 1)
+                if mix is not None and not applied:
                     applied = set_volume(GAME_SINK, mix[0]) & set_volume(CHAT_SINK, mix[1])
                 d = hub.read(1.0)
-                if d and d[0] == EVENT and d[1] == EV_CHATMIX:
+                if d and d[0] == EVENT and d[1] == EV_CHATMIX and valid_mix(d[2], d[3]):
                     mix = (d[2], d[3])
                     applied = False
         except OSError as e:
@@ -197,6 +380,7 @@ def cmd_chatmix_daemon(_hub, _args):
             if hub:
                 try:
                     hub.send(CMD_SOFTWARE_CHATMIX, 0)
+                    hub.send(CMD_SONAR_PRESENT, 0)
                 except OSError:
                     pass
                 os.close(hub.fd)
@@ -205,19 +389,19 @@ def cmd_chatmix_daemon(_hub, _args):
 def main():
     p = argparse.ArgumentParser(prog="arctis-omni", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
-    s = sub.add_parser("status", help="battery, ANC, sidetone and ChatMix state")
+    s = sub.add_parser("status", help="battery, noise mode, sidetone and ChatMix state")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
     s = sub.add_parser("anc", help="noise mode")
     s.add_argument("mode", choices=ANC_MODES)
     s.set_defaults(func=cmd_anc)
-    s = sub.add_parser("anc-level", help="ANC strength 1-3")
+    s = sub.add_parser("anc-level", help="ANC strength 1-3 (Omni only)")
     s.add_argument("level", type=int, choices=range(1, 4))
     s.set_defaults(func=cmd_anc_level)
     s = sub.add_parser("transparency-level", help="transparency strength 1-10")
     s.add_argument("level", type=int, choices=range(1, 11))
     s.set_defaults(func=cmd_transparency_level)
-    s = sub.add_parser("sidetone", help="on, off, or level 1-10")
+    s = sub.add_parser("sidetone", help="on, off, or a level (Omni 1-10, Nova Pro Wireless 1-3)")
     s.add_argument("value")
     s.set_defaults(func=cmd_sidetone)
     sub.add_parser("chatmix-daemon", help="run the ChatMix dial service").set_defaults(func=cmd_chatmix_daemon)

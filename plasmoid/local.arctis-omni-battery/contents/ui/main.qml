@@ -15,16 +15,19 @@ PlasmoidItem {
     property string error: ""
 
     readonly property bool connected: status !== null && status.connected
-    readonly property string batteryText: connected ? status.battery + "%" : "–"
+    // Wired models report no battery (battery is null).
+    readonly property bool hasBattery: connected && status.battery !== null
+    readonly property string batteryText: hasBattery ? status.battery + "%" : connected ? "Wired" : "–"
     readonly property string batteryIcon: {
-        if (!connected) return "audio-headset";
+        if (!hasBattery) return "audio-headset";
         const level = Math.min(100, Math.round(status.battery / 10) * 10);
         return "battery-" + String(level).padStart(3, "0") + (status.charging ? "-charging" : "");
     }
 
-    toolTipMainText: "Arctis Nova Pro Omni"
+    toolTipMainText: status ? status.model : "Arctis headset"
     toolTipSubText: error !== "" ? error
-        : connected ? "Headset " + status.battery + "% · spare " + status.charger_battery + "%"
+        : hasBattery ? "Headset " + status.battery + "% · spare " + status.charger_battery + "%"
+        : connected ? "Wired headset"
         : "Headset not connected"
 
     P5Support.DataSource {
@@ -54,8 +57,10 @@ PlasmoidItem {
     function refresh() { runner.connectSource(tool + " status --json"); }
     function run(args) { runner.connectSource(tool + " " + args); }
 
+    // Every 10 s in the panel, every 2 s while the popup is open, so a headset that
+    // connects, disconnects or changes settings shows up promptly.
     Timer {
-        interval: 60000
+        interval: root.expanded ? 2000 : 10000
         running: true
         repeat: true
         triggeredOnStart: true
@@ -81,7 +86,7 @@ PlasmoidItem {
             }
             PlasmaComponents.Label {
                 text: root.batteryText
-                color: root.connected && root.status.battery <= 15 ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+                color: root.hasBattery && root.status.battery <= 15 ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
             }
         }
     }
@@ -100,12 +105,21 @@ PlasmoidItem {
                 Layout.preferredWidth: Kirigami.Units.iconSizes.medium
                 Layout.preferredHeight: Kirigami.Units.iconSizes.medium
             }
-            Kirigami.Heading {
-                level: 3
-                text: root.connected ? "Headset " + root.status.battery + "%" + (root.status.charging ? " (charging)" : "")
-                    : root.error !== "" ? root.error : "Headset not connected"
-                wrapMode: Text.Wrap
+            ColumnLayout {
+                spacing: 0
                 Layout.fillWidth: true
+                Kirigami.Heading {
+                    level: 3
+                    text: root.status ? root.status.model : root.error !== "" ? root.error : "No headset found"
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                }
+                PlasmaComponents.Label {
+                    visible: root.status !== null
+                    text: root.hasBattery ? "Headset " + root.status.battery + "%" + (root.status.charging ? " (charging)" : "")
+                        : root.connected ? "Wired headset" : "Headset not connected"
+                    Layout.fillWidth: true
+                }
             }
         }
 
@@ -114,34 +128,51 @@ PlasmoidItem {
             visible: root.status !== null
             Layout.fillWidth: true
             PlasmaComponents.Label {
+                visible: root.status !== null && root.status.wireless
                 Kirigami.FormData.label: "Spare battery:"
                 text: root.status ? root.status.charger_battery + "%" : ""
             }
             PlasmaComponents.Label {
+                visible: root.status !== null && root.status.wireless
                 Kirigami.FormData.label: "Noise mode:"
-                text: !root.status ? "" : root.status.noise_mode === "anc" ? "ANC (level " + root.status.anc_level + "/3)"
+                // anc_level is null on models that only report the noise mode.
+                text: !root.status ? "" : root.status.noise_mode === "anc"
+                    ? "ANC" + (root.status.anc_level !== null ? " (level " + root.status.anc_level + "/3)" : "")
                     : root.status.noise_mode === "transparency" ? "Transparency (level " + root.status.transparency_level + "/10)"
                     : "Off"
             }
             RowLayout {
                 Kirigami.FormData.label: "Sidetone:"
                 Layout.fillWidth: true
-                // 0 = off, 1-10 = on at that level; sent on release so a drag is one command.
+                // 0 = off, 1-max = on at that level (max is per model); sent on release so a
+                // drag is one command.
                 PlasmaComponents.Slider {
                     id: sidetoneSlider
                     from: 0
-                    to: 10
+                    to: root.status ? root.status.sidetone_max : 10
                     stepSize: 1
                     snapMode: PlasmaComponents.Slider.SnapAlways
                     enabled: root.connected
                     Layout.fillWidth: true
+                    function apply() { root.run("sidetone " + (value === 0 ? "off" : value)); }
                     onPressedChanged: {
-                        if (!pressed) root.run("sidetone " + (value === 0 ? "off" : value));
+                        if (!pressed) apply();
+                    }
+                    // The mouse wheel steps the value and emits moved() without a press, so
+                    // wait for the scrolling to settle and send once.
+                    onMoved: {
+                        if (!pressed) wheelSettle.restart();
+                    }
+                    Timer {
+                        id: wheelSettle
+                        interval: 300
+                        onTriggered: sidetoneSlider.apply()
                     }
                     Connections {
                         target: root
                         function onStatusChanged() {
-                            if (!sidetoneSlider.pressed && root.status)
+                            // Don't overwrite a drag, or a scroll that hasn't been sent yet.
+                            if (!sidetoneSlider.pressed && !wheelSettle.running && root.status)
                                 sidetoneSlider.value = root.status.sidetone_on ? root.status.sidetone_level : 0;
                         }
                     }
@@ -153,7 +184,7 @@ PlasmoidItem {
             }
             PlasmaComponents.Label {
                 Kirigami.FormData.label: "Mic:"
-                text: !root.status ? "" : "Volume " + root.status.mic_volume + "/10" + (root.status.mic_muted ? ", muted" : "")
+                text: !root.status ? "" : "Volume " + root.status.mic_volume + "/10" + (root.status.mic_muted === true ? ", muted" : "")
             }
             PlasmaComponents.Label {
                 Kirigami.FormData.label: "ChatMix:"
@@ -162,7 +193,7 @@ PlasmoidItem {
         }
 
         RowLayout {
-            visible: root.connected
+            visible: root.connected && root.status.anc_writable
             Layout.alignment: Qt.AlignHCenter
             Repeater {
                 model: [["off", "Off"], ["transparency", "Transparency"], ["anc", "ANC"]]
@@ -173,6 +204,13 @@ PlasmoidItem {
                     onClicked: root.run("anc " + modelData[0])
                 }
             }
+        }
+
+        PlasmaComponents.Label {
+            visible: root.connected && root.status.wireless && !root.status.anc_writable
+            text: "Change the noise mode on the headset"
+            opacity: 0.7
+            Layout.alignment: Qt.AlignHCenter
         }
     }
 }
