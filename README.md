@@ -180,16 +180,25 @@ and then checked against the hardware. One exception: GG only *reads* the noise 
 Nova Pro Wireless. The `BD` and `B9` writes were found to work on it by testing, not from GG.
 
 **Verified on hardware:**
-- Omni (base firmware 1.28.0): status/battery fields, noise mode switching, sidetone set and
-  read back, ChatMix enable plus dial events.
+- Omni, base firmware 1.32.0 / DSP 0.36.0, headset 0.36.0 (and earlier 1.28.0 / 0.33.0):
+  status/battery fields, noise mode switching, ANC strength and transparency level (1.32.0),
+  sidetone set and read back, ChatMix enable plus dial events, including after a replug.
 - Nova Pro Wireless (`12e5`): status/battery fields, noise mode (off / transparency / ANC,
   confirmed audibly), transparency level, sidetone set and read back, ChatMix routing and
   dial events.
 - Nova Pro wired (`12cb`, GameDAC firmware DSP 2.04.00 / MCU 1.10.08 / USB 0.28.00):
   sidetone set and read back, Sonar present, ChatMix routing and dial events.
 
-**Not yet verified:** the Omni's ANC/transparency *level* writes, and the charging value of
-`[15]` while actually charging.
+**Not yet verified:** the charging value of `[15]` while actually charging.
+
+## Firmware updates
+
+Firmware isn't updated from Linux. Use SteelSeries GG on Windows. For the Omni, GG's updater
+only starts with **both the GameHub and the headset connected to the PC by USB cable**.
+
+On Omni firmware 1.32.0, the knob only enters ChatMix mode if software ChatMix is enabled
+*before* Sonar present, after both have been cleared. The service does this, and waits 5 s
+after the hub appears (as GG does) before talking to it.
 
 ## Battery in HeadsetControl
 
