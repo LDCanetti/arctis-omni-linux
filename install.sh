@@ -64,6 +64,15 @@ else
 fi
 
 echo "Installed."
+# The service and widget use absolute paths; only interactive use of the CLI needs PATH.
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+        echo "  - $BIN_DIR is not on your PATH, so 'arctis-omni' won't be found in a shell."
+        echo "    For bash/zsh, add this to ~/.bashrc or ~/.zshrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "    (or run it as $BIN_DIR/arctis-omni)"
+        ;;
+esac
 echo "  - Set your default output to \"Arctis Game\" and your voice app's output to \"Arctis Chat\"."
 if [ "$plasmoid_changed" = 1 ]; then
     echo "  - Widget updated: add \"Arctis Headset Battery\" to a panel, or run"
