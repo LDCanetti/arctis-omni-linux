@@ -51,6 +51,7 @@ On the wired Nova Pro it shows only what that headset has:
   arctis-omni anc-level 1-3              # Omni only
   arctis-omni transparency-level 1-10    # wireless models
   arctis-omni sidetone on|off|<level>   # Omni 1-10, Nova Pro Wireless / wired 1-3
+  arctis-omni output [headset|<sink>]   # where Arctis Game/Chat play (see below)
   ```
 - **ChatMix**: a user service plus PipeWire config that adds two outputs, **Arctis Game**
   and **Arctis Chat**. The service routes both to whichever supported headset is
@@ -96,6 +97,25 @@ only lets its knob switch to ChatMix while "Sonar present" is set (it shows a So
 
 The loopback sinks use `node.dont-fallback` + `node.linger`. If the headset disappears, they
 wait for it instead of moving your game audio to the speakers.
+
+### Playing Game and Chat somewhere else
+
+To switch to speakers without losing chat, move both outputs instead of changing your
+default output:
+
+```sh
+arctis-omni output alsa_output.pci-0000_11_00.6.analog-stereo   # a sink name from 'pactl list short sinks'
+arctis-omni output headset                                       # back to the headset
+arctis-omni output                                               # show the current choice
+```
+
+Apps stay on Arctis Game / Arctis Chat, and the ChatMix dial keeps balancing them. The choice
+is saved in `~/.local/state/arctis-omni/output`, and the service keeps it across restarts.
+If that output disappears, it falls back to the headset. Bind the two commands to a hotkey
+to toggle.
+
+Apps that hold an audio stream open all the time (Discord does while it runs) keep whatever
+output Arctis Chat plays to awake, the same as if they played to it directly.
 
 ## Protocol
 
